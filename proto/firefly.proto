@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package firefly.server;
+
+service InferenceService {
+  rpc ChatCompletion (ChatCompletionRequest) returns (ChatCompletionResponse) {}
+  rpc ChatCompletionStream (ChatCompletionRequest) returns (stream ChatCompletionStreamResponse) {}
+}
+
+message ChatMessage {
+  string role = 1;
+  string content = 2;
+}
+
+message ChatCompletionRequest {
+  string model = 1;
+  int32 max_tokens = 2;
+  repeated ChatMessage messages = 3;
+  string prompt = 4;
+}
+
+message MessageChoice {
+  int32 index = 1;
+  ChatMessage message = 2;
+  string reasoning_content = 3;
+  string finish_reason = 4;
+}
+
+message Usage {
+  int32 prompt_tokens = 1;
+  int32 completion_tokens = 2;
+  int32 total_tokens = 3;
+}
+
+message ChatCompletionResponse {
+  string id = 1;
+  string object = 2;
+  int64 created = 3;
+  string model = 4;
+  repeated MessageChoice choices = 5;
+  Usage usage = 6;
+}
+
+message DeltaMessage {
+  string content = 1;
+  string reasoning_content = 2;
+}
+
+message StreamChoice {
+  int32 index = 1;
+  DeltaMessage delta = 2;
+  string finish_reason = 3;
+}
+
+message ChatCompletionStreamResponse {
+  string id = 1;
+  string object = 2;
+  int64 created = 3;
+  string model = 4;
+  repeated StreamChoice choices = 5;
+}

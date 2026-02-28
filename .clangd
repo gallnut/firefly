@@ -1,0 +1,10 @@
+CompileFlags:
+  Add: [-x, cuda, --cuda-gpu-arch=sm_89, -L/opt/cuda/lib64]
+  Remove:
+    - -Xcudafe
+    - -gencode*
+    - --generate-code*
+    - -O*
+    - -Xcompiler*
+    - --diag_suppress*
+    - --use_fast_math

@@ -1,0 +1,15 @@
+build/
+bin/
+lib/
+
+.cpm/
+.cache/
+.vscode/
+
+qwen3/
+
+**/__pycache__/
+**/.venv/
+
+example/firefly_pb2_grpc.py
+example/firefly_pb2.py
