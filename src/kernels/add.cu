@@ -3,6 +3,7 @@
 
 #include <iostream>
 
+#include "firefly/cuda_dtype.cuh"
 #include "firefly/kernels.h"
 
 // Vectorized load/store types for half
@@ -12,8 +13,8 @@
 namespace firefly::kernels
 {
 
-template <int VEC_SIZE = 8>
-__global__ void add_inplace_kernel_optimized(half* __restrict__ x, const half* __restrict__ y, int size)
+template <typename scalar_t, int VEC_SIZE = 8>
+__global__ void add_inplace_kernel_optimized(scalar_t* __restrict__ x, const scalar_t* __restrict__ y, int size)
 {
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * VEC_SIZE;
 
@@ -26,37 +27,37 @@ __global__ void add_inplace_kernel_optimized(half* __restrict__ x, const half* _
     float4 x_vec = LOAD128BITS(x[idx]);
     float4 y_vec = LOAD128BITS(y[idx]);
 
-    half* x_h = reinterpret_cast<half*>(&x_vec);
-    half* y_h = reinterpret_cast<half*>(&y_vec);
+    scalar_t* x_h = reinterpret_cast<scalar_t*>(&x_vec);
+    scalar_t* y_h = reinterpret_cast<scalar_t*>(&y_vec);
 
 #pragma unroll
     for (int i = 0; i < VEC_SIZE; ++i)
     {
         // use float addition
-        float a = __half2float(x_h[i]);
-        float b = __half2float(y_h[i]);
-        x_h[i] = __float2half(a + b);
+        float a = CudaScalar<scalar_t>::to_float(x_h[i]);
+        float b = CudaScalar<scalar_t>::to_float(y_h[i]);
+        x_h[i] = CudaScalar<scalar_t>::from_float(a + b);
     }
 
     // Vectorized store back to x
     STORE128BITS(x[idx]) = x_vec;
 }
 
-__global__ void add_inplace_kernel(half* x, const half* y, int size)
+template <typename scalar_t>
+__global__ void add_inplace_kernel(scalar_t* x, const scalar_t* y, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size)
     {
-        float a = __half2float(x[idx]);
-        float b = __half2float(y[idx]);
-        x[idx] = __float2half(a + b);
+        float a = CudaScalar<scalar_t>::to_float(x[idx]);
+        float b = CudaScalar<scalar_t>::to_float(y[idx]);
+        x[idx] = CudaScalar<scalar_t>::from_float(a + b);
     }
 }
 
-void add_inplace(Tensor& x, const Tensor& y)
+template <typename scalar_t>
+void dispatch_add_inplace(Tensor& x, const Tensor& y, int64_t numel)
 {
-    int64_t numel = x.numel();
-
     // Check alignment for vectorized kernel
     bool is_aligned = (reinterpret_cast<uintptr_t>(x.data()) % 16 == 0) &&
                       (reinterpret_cast<uintptr_t>(y.data()) % 16 == 0) && (numel % 8 == 0);
@@ -66,15 +67,32 @@ void add_inplace(Tensor& x, const Tensor& y)
         constexpr int vec_size = 8;
         int           threads = 256;
         int           num_blocks = (numel + (threads * vec_size) - 1) / (threads * vec_size);
-        add_inplace_kernel_optimized<vec_size><<<num_blocks, threads, 0, get_default_stream()>>>(
-            (half*)x.data(), (const half*)y.data(), static_cast<int>(numel));
+        add_inplace_kernel_optimized<scalar_t, vec_size><<<num_blocks, threads, 0, get_default_stream()>>>(
+            static_cast<scalar_t*>(x.data()), static_cast<const scalar_t*>(y.data()), static_cast<int>(numel));
     }
     else
     {
         int threads = 256;
         int num_blocks = (numel + threads - 1) / threads;
-        add_inplace_kernel<<<num_blocks, threads, 0, get_default_stream()>>>((half*)x.data(), (const half*)y.data(),
-                                                                             static_cast<int>(numel));
+        add_inplace_kernel<scalar_t><<<num_blocks, threads, 0, get_default_stream()>>>(
+            static_cast<scalar_t*>(x.data()), static_cast<const scalar_t*>(y.data()), static_cast<int>(numel));
+    }
+}
+
+void add_inplace(Tensor& x, const Tensor& y)
+{
+    require_float16_or_bfloat16(x.dtype(), "add_inplace");
+    require_same_dtype(x.dtype(), y.dtype(), "add_inplace");
+
+    int64_t numel = x.numel();
+
+    if (x.dtype() == DType::BF16)
+    {
+        dispatch_add_inplace<__nv_bfloat16>(x, y, numel);
+    }
+    else
+    {
+        dispatch_add_inplace<half>(x, y, numel);
     }
 
     cudaError_t err = cudaGetLastError();

@@ -187,11 +187,10 @@ public:
                 choice->set_reasoning_content(scrub_utf8(reasoning_content));
             }
 
-            // Fake usage for now just as placeholder (since we didn't track prompt tokens here)
             auto *usage = reply->mutable_usage();
-            usage->set_prompt_tokens(0);
-            usage->set_completion_tokens(0);
-            usage->set_total_tokens(0);
+            usage->set_prompt_tokens(session->has_usage ? session->prompt_tokens : 0);
+            usage->set_completion_tokens(session->has_usage ? session->completion_tokens : 0);
+            usage->set_total_tokens(session->has_usage ? session->total_tokens : 0);
         }
         catch (const std::exception &e)
         {
@@ -240,12 +239,27 @@ public:
         // Consumer loop runs on the gRPC thread, unpacking chunks and handling network writes
         while (true)
         {
+            if (context->IsCancelled())
+            {
+                session->cancel();
+                break;
+            }
+
             std::pair<std::string, bool> item;
             {
                 std::unique_lock<std::mutex> lock(session->mtx);
-                session->cv.wait(lock, [&]() { return !session->output_queue.empty() || session->is_finished; });
+                session->cv.wait_for(lock, std::chrono::milliseconds(100),
+                                     [&]() { return !session->output_queue.empty() || session->is_finished; });
+
+                if (context->IsCancelled())
+                {
+                    lock.unlock();
+                    session->cancel();
+                    break;
+                }
 
                 if (session->output_queue.empty() && session->is_finished) break;
+                if (session->output_queue.empty()) continue;
 
                 item = session->output_queue.front();
                 session->output_queue.pop();
@@ -288,6 +302,13 @@ public:
                     if (is_finished)
                     {
                         choice->set_finish_reason("stop");
+                        if (session->has_usage)
+                        {
+                            auto *usage = resp.mutable_usage();
+                            usage->set_prompt_tokens(session->prompt_tokens);
+                            usage->set_completion_tokens(session->completion_tokens);
+                            usage->set_total_tokens(session->total_tokens);
+                        }
                     }
                     else
                     {

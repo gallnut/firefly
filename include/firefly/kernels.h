@@ -5,6 +5,14 @@
 namespace firefly::kernels
 {
 
+enum class AttentionBackend
+{
+    Auto,
+    Paged,
+    Contiguous,
+    External
+};
+
 void         set_default_stream(cudaStream_t stream);
 cudaStream_t get_default_stream();
 
@@ -81,7 +89,20 @@ void apply_rope(Tensor& q, Tensor& k, int head_dim, int seq_len, float theta, co
  * @param context_lens Array of context lengths per batch element.
  */
 void attention(Tensor& q, Tensor& k, Tensor& v, Tensor& output, void* kv_cache_block_table, int kv_head_num,
-               int seq_len, int max_context_blocks, const int* context_lens);
+               int seq_len, int max_context_blocks, const int* context_lens, bool prefer_split_decode = false,
+               int max_decode_context_len = 0);
+
+void attention_ex(Tensor& q, Tensor& k, Tensor& v, Tensor& output, void* kv_cache_block_table, int kv_head_num,
+                  int seq_len, int max_context_blocks, const int* context_lens, AttentionBackend backend,
+                  bool prefer_split_decode = false, int max_decode_context_len = 0, int prefill_context_len = -1);
+
+bool torch_flash_attention_available();
+bool torch_flash_attention(Tensor& q, Tensor& k, Tensor& v, Tensor& output, int kv_head_num, int seq_len);
+bool torch_flash_paged_prefill(Tensor& q, Tensor& k_cache, Tensor& v_cache, Tensor& output, const int* block_table,
+                               int kv_head_num, int seq_len, int max_context_blocks, int context_len);
+
+AttentionBackend get_attention_backend();
+const char*      attention_backend_name(AttentionBackend backend);
 
 /**
  * @brief Performs argmax for greedy sampling.

@@ -10,6 +10,7 @@
 #include <unordered_map>
 
 #include "firefly/engine.h"
+#include "firefly/kernels.h"
 #include "firefly/mm/allocator.h"
 #include "firefly/mm/model_weight_pool.h"
 #include "firefly/model/model.h"
@@ -53,6 +54,20 @@ model::ModelConfig load_config(const std::string& config_path, std::string& out_
     config.rms_norm_eps = j.value("rms_norm_eps", 1e-6);
     config.rope_theta = j.value("rope_theta", 10000.0f);
 
+    std::string torch_dtype = j.value("torch_dtype", "float16");
+    if (torch_dtype == "bfloat16" || torch_dtype == "bf16")
+    {
+        config.dtype = DType::BF16;
+    }
+    else if (torch_dtype == "float32" || torch_dtype == "fp32")
+    {
+        config.dtype = DType::F32;
+    }
+    else
+    {
+        config.dtype = DType::F16;
+    }
+
     if (j.contains("architectures") && j["architectures"].is_array() && !j["architectures"].empty())
     {
         out_arch = j["architectures"][0].get<std::string>();
@@ -81,7 +96,7 @@ int main(int argc, char** argv)
         DeviceAllocator<Device::CUDA>::init(0, UINT64_MAX);
 
         std::string model_dir = "qwen3";
-        int         max_prefill_chunk_size = 256;
+        int         max_prefill_chunk_size = 4096;
 
         for (int i = 1; i < argc; ++i)
         {
@@ -103,6 +118,13 @@ int main(int argc, char** argv)
         std::string arch;
         auto        config = load_config(config_path, arch);
         std::cout << "Detected architecture: " << arch << std::endl;
+        std::cout << "Runtime options:\n";
+        std::cout << "  Max prefill chunk size: " << max_prefill_chunk_size << " tokens\n";
+        std::cout << "  Attention backend: "
+                  << firefly::kernels::attention_backend_name(firefly::kernels::get_attention_backend()) << "\n";
+        size_t kv_bytes_per_token = static_cast<size_t>(config.num_hidden_layers) * config.num_key_value_heads *
+                                    config.head_dim * 2 * dtype_size(config.dtype);
+        std::cout << "  KV cache/token: " << kv_bytes_per_token / 1024.0 << " KiB\n";
 
         std::cout << "Loading weights from " << weights_path << "..." << std::endl;
         mm::ModelWeightPool<Device::CUDA> weight_pool;
@@ -117,6 +139,10 @@ int main(int argc, char** argv)
             return 1;
         }
         auto weights_map = std::move(result.value());
+        if (auto it = weights_map.find("model.embed_tokens.weight"); it != weights_map.end())
+        {
+            config.dtype = it->second.dtype();
+        }
 
         std::unique_ptr<model::Model> base_model = model::ModelRegistry::get().create(arch, config);
         base_model->load_weights(weights_map);
@@ -168,7 +194,8 @@ int main(int argc, char** argv)
 
                     if (session_ptr)
                     {
-                        session_ptr->push(item.text, item.is_finished);
+                        session_ptr->push(item.text, item.is_finished, item.has_usage ? item.prompt_tokens : -1,
+                                          item.has_usage ? item.completion_tokens : -1);
                         if (item.is_finished)
                         {
                             std::lock_guard<std::mutex> lock(sessions_mtx);
@@ -184,8 +211,8 @@ int main(int argc, char** argv)
             try
             {
                 std::vector<int> input_ids;
-                int              im_start_id = 151644;
-                int              im_end_id = 151645;
+                int              im_start_id = tokenizer.token_id("<|im_start|>");
+                int              im_end_id = tokenizer.token_id("<|im_end|>");
                 int              max_tokens = 512;
                 std::string      request_model = "qwen3";
 
@@ -248,7 +275,7 @@ int main(int argc, char** argv)
                 }
 
                 // Push the async inference job to the Engine. It no longer blocks this thread!
-                engine.async_generate(req_id, input_ids, max_tokens);
+                engine.async_generate(req_id, input_ids, max_tokens, session->cancel_flag);
 
                 // The parsing logic (CoT tag hiding, json building) previously done here inline
                 // is now the responsibility of `grpc_adapter.cc`'s Consumer loop, reading from `session`.

@@ -13,6 +13,10 @@ struct ResultItem
     std::string req_id;
     std::string text;
     bool        is_finished;
+    int         prompt_tokens = 0;
+    int         completion_tokens = 0;
+    int         total_tokens = 0;
+    bool        has_usage = false;
 };
 
 class ResultQueue
@@ -21,10 +25,22 @@ public:
     ResultQueue() = default;
     ~ResultQueue() = default;
 
-    void push(const std::string& req_id, const std::string& text, bool is_finished)
+    void push(const std::string& req_id, const std::string& text, bool is_finished, int prompt_tokens = -1,
+              int completion_tokens = -1)
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        queue_.push({req_id, text, is_finished});
+        ResultItem                  item;
+        item.req_id = req_id;
+        item.text = text;
+        item.is_finished = is_finished;
+        if (prompt_tokens >= 0 && completion_tokens >= 0)
+        {
+            item.prompt_tokens = prompt_tokens;
+            item.completion_tokens = completion_tokens;
+            item.total_tokens = prompt_tokens + completion_tokens;
+            item.has_usage = true;
+        }
+        queue_.push(std::move(item));
         cv_.notify_one();
     }
 

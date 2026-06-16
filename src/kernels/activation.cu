@@ -3,6 +3,7 @@
 
 #include <iostream>
 
+#include "firefly/cuda_dtype.cuh"
 #include "firefly/kernels.h"
 
 #define LOAD128BITS(value) (*reinterpret_cast<const float4*>(&(value)))
@@ -20,9 +21,9 @@ __device__ __forceinline__ float swish_func(float x)
 
 // SwiGLU Kernel (Optimized with Vectorized Load/Store)
 // Out = Swish(Gate) * Up
-template <int VEC_SIZE = 8>
-__global__ void swiglu_kernel_optimized(const half* __restrict__ gate, const half* __restrict__ up,
-                                        half* __restrict__ output, int size)
+template <typename scalar_t, int VEC_SIZE = 8>
+__global__ void swiglu_kernel_optimized(const scalar_t* __restrict__ gate, const scalar_t* __restrict__ up,
+                                        scalar_t* __restrict__ output, int size)
 {
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * VEC_SIZE;
 
@@ -37,22 +38,22 @@ __global__ void swiglu_kernel_optimized(const half* __restrict__ gate, const hal
     float4 up_vec = LOAD128BITS(up[idx]);
 
     // Reinterpret as half arrays for access
-    half* gate_h = reinterpret_cast<half*>(&gate_vec);
-    half* up_h = reinterpret_cast<half*>(&up_vec);
+    scalar_t* gate_h = reinterpret_cast<scalar_t*>(&gate_vec);
+    scalar_t* up_h = reinterpret_cast<scalar_t*>(&up_vec);
 
-    float4 out_vec;
-    half*  out_h = reinterpret_cast<half*>(&out_vec);
+    float4    out_vec;
+    scalar_t* out_h = reinterpret_cast<scalar_t*>(&out_vec);
 
 #pragma unroll
     for (int i = 0; i < VEC_SIZE; ++i)
     {
-        float g_val = __half2float(gate_h[i]);
-        float u_val = __half2float(up_h[i]);
+        float g_val = CudaScalar<scalar_t>::to_float(gate_h[i]);
+        float u_val = CudaScalar<scalar_t>::to_float(up_h[i]);
 
         // SwiGLU logic
         float res = swish_func(g_val) * u_val;
 
-        out_h[i] = __float2half(res);
+        out_h[i] = CudaScalar<scalar_t>::from_float(res);
     }
 
     // Vectorized store
@@ -62,7 +63,8 @@ __global__ void swiglu_kernel_optimized(const half* __restrict__ gate, const hal
 // Scalar Fallback (for unaligned tails)
 // out = (swish(gate) * up) * down is usually handled in MLP block logic
 // Here: out = swish(gate) * up
-__global__ void swiglu_kernel(const half* gate, const half* up, half* output, int size)
+template <typename scalar_t>
+__global__ void swiglu_kernel(const scalar_t* gate, const scalar_t* up, scalar_t* output, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size)
@@ -73,18 +75,17 @@ __global__ void swiglu_kernel(const half* gate, const half* up, half* output, in
         // output[idx] is half
         // Pointers are valid device pointers?
 
-        float g = __half2float(gate[idx]);
-        float u = __half2float(up[idx]);
+        float g = CudaScalar<scalar_t>::to_float(gate[idx]);
+        float u = CudaScalar<scalar_t>::to_float(up[idx]);
         // swish(x) = x * sigmoid(x)
         float swish = swish_func(g);
-        output[idx] = __float2half(swish * u);
+        output[idx] = CudaScalar<scalar_t>::from_float(swish * u);
     }
 }
 
-void swiglu(const Tensor& gate, const Tensor& up, Tensor& output)
+template <typename scalar_t>
+void dispatch_swiglu(const Tensor& gate, const Tensor& up, Tensor& output, int64_t numel)
 {
-    int64_t numel = output.numel();
-
     // Check alignment for vectorized kernel
     // Pointers must be 16-byte aligned and size divisible by 8
     bool is_aligned = (reinterpret_cast<uintptr_t>(gate.data()) % 16 == 0) &&
@@ -99,16 +100,36 @@ void swiglu(const Tensor& gate, const Tensor& up, Tensor& output)
         int           elements_per_thread = vec_size;
         int           num_blocks = (numel + (threads * elements_per_thread) - 1) / (threads * elements_per_thread);
 
-        swiglu_kernel_optimized<vec_size><<<num_blocks, threads, 0, get_default_stream()>>>(
-            (const half*)gate.data(), (const half*)up.data(), (half*)output.data(), static_cast<int>(numel));
+        swiglu_kernel_optimized<scalar_t, vec_size><<<num_blocks, threads, 0, get_default_stream()>>>(
+            static_cast<const scalar_t*>(gate.data()), static_cast<const scalar_t*>(up.data()),
+            static_cast<scalar_t*>(output.data()), static_cast<int>(numel));
     }
     else
     {
         // Fallback
         int block_size = 256;
         int grid_size = (numel + block_size - 1) / block_size;
-        swiglu_kernel<<<grid_size, block_size, 0, get_default_stream()>>>(
-            (const half*)gate.data(), (const half*)up.data(), (half*)output.data(), static_cast<int>(numel));
+        swiglu_kernel<scalar_t><<<grid_size, block_size, 0, get_default_stream()>>>(
+            static_cast<const scalar_t*>(gate.data()), static_cast<const scalar_t*>(up.data()),
+            static_cast<scalar_t*>(output.data()), static_cast<int>(numel));
+    }
+}
+
+void swiglu(const Tensor& gate, const Tensor& up, Tensor& output)
+{
+    require_float16_or_bfloat16(gate.dtype(), "swiglu");
+    require_same_dtype(gate.dtype(), up.dtype(), "swiglu");
+    require_same_dtype(gate.dtype(), output.dtype(), "swiglu");
+
+    int64_t numel = output.numel();
+
+    if (gate.dtype() == DType::BF16)
+    {
+        dispatch_swiglu<__nv_bfloat16>(gate, up, output, numel);
+    }
+    else
+    {
+        dispatch_swiglu<half>(gate, up, output, numel);
     }
 
     cudaError_t err = cudaGetLastError();

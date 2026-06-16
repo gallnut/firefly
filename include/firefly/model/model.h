@@ -11,6 +11,7 @@ namespace firefly::model
 
 struct ModelConfig
 {
+    DType  dtype = DType::F16;
     int    hidden_size;
     int    intermediate_size;
     int    num_hidden_layers;
@@ -43,7 +44,9 @@ public:
      * @return Tensor shape [batch_size, seq_len, vocab_size] representing logits.
      */
     virtual Tensor forward(const Tensor& input_ids, const Tensor& context_lens, std::vector<Tensor>& k_caches,
-                           std::vector<Tensor>& v_caches, int* block_table, int max_blocks) = 0;
+                           std::vector<Tensor>& v_caches, int* block_table, int max_blocks,
+                           bool compute_logits = true, bool prefer_split_decode = false,
+                           int max_decode_context_len = 0, int min_context_len = -1) = 0;
 };
 
 }  // namespace firefly::model

@@ -3,6 +3,7 @@
 
 #include <iostream>
 
+#include "firefly/cuda_dtype.cuh"
 #include "firefly/kernels.h"
 
 #define WARP_SIZE 32
@@ -57,18 +58,18 @@ __device__ __forceinline__ T block_reduce_sum(T val)
     return shared_warps[0];
 }
 
-template <int NUM_THREADS>
-__global__ void rms_norm_kernel_optimized(const half* __restrict__ input, const half* __restrict__ weight,
-                                          half* __restrict__ output, int hidden_size, float epsilon)
+template <typename scalar_t, int NUM_THREADS>
+__global__ void rms_norm_kernel_optimized(const scalar_t* __restrict__ input, const scalar_t* __restrict__ weight,
+                                          scalar_t* __restrict__ output, int hidden_size, float epsilon)
 {
     // Rows: each block handles one token
     // GridDim.x = Batch * Seq
     const int tid = threadIdx.x;
     const int bid = blockIdx.x;
 
-    const int   offset = bid * hidden_size;
-    const half* row_input = input + offset;
-    half*       row_output = output + offset;
+    const int       offset = bid * hidden_size;
+    const scalar_t* row_input = input + offset;
+    scalar_t*       row_output = output + offset;
 
     float sum_sq = 0.0f;
 
@@ -79,14 +80,25 @@ __global__ void rms_norm_kernel_optimized(const half* __restrict__ input, const 
     // Stride loop
     for (int idx = tid * VEC_SIZE; idx < hidden_size; idx += NUM_THREADS * VEC_SIZE)
     {
-        vec_t in_vec = LOAD128BITS(row_input[idx]);
-        half* in_h = reinterpret_cast<half*>(&in_vec);
+        if (idx + VEC_SIZE <= hidden_size)
+        {
+            vec_t     in_vec = LOAD128BITS(row_input[idx]);
+            scalar_t* in_h = reinterpret_cast<scalar_t*>(&in_vec);
 
 #pragma unroll
-        for (int i = 0; i < VEC_SIZE; ++i)
+            for (int i = 0; i < VEC_SIZE; ++i)
+            {
+                float val = CudaScalar<scalar_t>::to_float(in_h[i]);
+                sum_sq += val * val;
+            }
+        }
+        else
         {
-            float val = __half2float(in_h[i]);
-            sum_sq += val * val;
+            for (int i = idx; i < hidden_size; ++i)
+            {
+                float val = CudaScalar<scalar_t>::to_float(row_input[i]);
+                sum_sq += val * val;
+            }
         }
     }
 
@@ -108,49 +120,50 @@ __global__ void rms_norm_kernel_optimized(const half* __restrict__ input, const 
 
     for (int idx = tid * VEC_SIZE; idx < hidden_size; idx += NUM_THREADS * VEC_SIZE)
     {
-        vec_t in_vec = LOAD128BITS(row_input[idx]);
-        half* in_h = reinterpret_cast<half*>(&in_vec);
+        if (idx + VEC_SIZE <= hidden_size)
+        {
+            vec_t     in_vec = LOAD128BITS(row_input[idx]);
+            scalar_t* in_h = reinterpret_cast<scalar_t*>(&in_vec);
 
-        vec_t w_vec = LOAD128BITS(weight[idx]);
-        half* w_h = reinterpret_cast<half*>(&w_vec);
+            vec_t     w_vec = LOAD128BITS(weight[idx]);
+            scalar_t* w_h = reinterpret_cast<scalar_t*>(&w_vec);
 
-        vec_t out_vec;
-        half* out_h = reinterpret_cast<half*>(&out_vec);
+            vec_t     out_vec;
+            scalar_t* out_h = reinterpret_cast<scalar_t*>(&out_vec);
 
 #pragma unroll
-        for (int i = 0; i < VEC_SIZE; ++i)
-        {
-            float val = __half2float(in_h[i]);
-            float w = __half2float(w_h[i]);
+            for (int i = 0; i < VEC_SIZE; ++i)
+            {
+                float val = CudaScalar<scalar_t>::to_float(in_h[i]);
+                float w = CudaScalar<scalar_t>::to_float(w_h[i]);
 
-            // Formula: x * inv_rms * weight
-            out_h[i] = __float2half(val * inv_rms * w);
+                out_h[i] = CudaScalar<scalar_t>::from_float(val * inv_rms * w);
+            }
+
+            STORE128BITS(row_output[idx]) = out_vec;
         }
-
-        STORE128BITS(row_output[idx]) = out_vec;
+        else
+        {
+            for (int i = idx; i < hidden_size; ++i)
+            {
+                float val = CudaScalar<scalar_t>::to_float(row_input[i]);
+                float w = CudaScalar<scalar_t>::to_float(weight[i]);
+                row_output[i] = CudaScalar<scalar_t>::from_float(val * inv_rms * w);
+            }
+        }
     }
 }
 
-#define LAUNCH_RMS_NORM_OPTIMIZED(THREADS)                                                                             \
-    rms_norm_kernel_optimized<THREADS><<<grid, THREADS, 0, stream>>>((const half*)input.data(),                        \
-                                                                     (const half*)weight.data(), (half*)output.data(), \
-                                                                     hidden_size, static_cast<float>(epsilon));
-
-void rms_norm(const Tensor& input, const Tensor& weight, Tensor& output, double epsilon)
+template <typename scalar_t>
+void dispatch_rms_norm(const Tensor& input, const Tensor& weight, Tensor& output, int hidden_size, int num_tokens,
+                       double epsilon, cudaStream_t stream)
 {
-    const int hidden_size = input.shape().back();
-    const int num_tokens = input.numel() / hidden_size;
+    dim3 grid(num_tokens);
 
-    dim3         grid(num_tokens);
-    cudaStream_t stream = get_default_stream();  // TODO: get stream from context if available
-
-    // Heuristic:
-    // We process 8 elements per thread (float4 load of halfs).
-    // Ideally we want one thread block to cover the entire hidden_size without looping too much,
-    // but bounded by Max Threads (1024).
-    //
-    // Dispatch based on hidden_size prevents register pressure changes or occupancy issues
-    // from affecting all sizes, and allows compiler to optimize the block reduction for constant block size.
+#define LAUNCH_RMS_NORM_OPTIMIZED(THREADS)                                                       \
+    rms_norm_kernel_optimized<scalar_t, THREADS><<<grid, THREADS, 0, stream>>>(                  \
+        static_cast<const scalar_t*>(input.data()), static_cast<const scalar_t*>(weight.data()), \
+        static_cast<scalar_t*>(output.data()), hidden_size, static_cast<float>(epsilon));
 
     if (hidden_size <= 512)
     {
@@ -176,6 +189,29 @@ void rms_norm(const Tensor& input, const Tensor& weight, Tensor& output, double 
     {
         // For very large sizes, cap at 1024 threads (handling 8192 elements per iteration)
         LAUNCH_RMS_NORM_OPTIMIZED(1024);
+    }
+
+#undef LAUNCH_RMS_NORM_OPTIMIZED
+}
+
+void rms_norm(const Tensor& input, const Tensor& weight, Tensor& output, double epsilon)
+{
+    require_float16_or_bfloat16(input.dtype(), "rms_norm");
+    require_same_dtype(input.dtype(), weight.dtype(), "rms_norm");
+    require_same_dtype(input.dtype(), output.dtype(), "rms_norm");
+
+    const int hidden_size = input.shape().back();
+    const int num_tokens = input.numel() / hidden_size;
+
+    cudaStream_t stream = get_default_stream();  // TODO: get stream from context if available
+
+    if (input.dtype() == DType::BF16)
+    {
+        dispatch_rms_norm<__nv_bfloat16>(input, weight, output, hidden_size, num_tokens, epsilon, stream);
+    }
+    else
+    {
+        dispatch_rms_norm<half>(input, weight, output, hidden_size, num_tokens, epsilon, stream);
     }
 
     cudaError_t err = cudaGetLastError();

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <memory>
 #include <thread>
 #include <unordered_map>
 
@@ -29,7 +30,8 @@ public:
      * @param input_ids Tokenized input sequence.
      * @param max_tokens Maximum number of tokens to generate.
      */
-    void async_generate(const std::string& id, const std::vector<int>& input_ids, int max_tokens);
+    void async_generate(const std::string& id, const std::vector<int>& input_ids, int max_tokens,
+                        std::shared_ptr<std::atomic_bool> cancel_flag = nullptr);
 
     void start();
     void stop();
@@ -52,6 +54,17 @@ private:
 
     int max_context_blocks_ = 1024;
     int max_prefill_chunk_size_ = 256;
+    int decode_scratch_first_block_ = 0;
+    int decode_scratch_blocks_ = 0;
+
+    Tensor  decode_fb_input_storage_;
+    Tensor  decode_fb_context_storage_;
+    Tensor  decode_fb_block_table_storage_;
+    Tensor  decode_fb_next_token_storage_;
+    int64_t decode_fb_input_capacity_ = 0;
+    int64_t decode_fb_context_capacity_ = 0;
+    int64_t decode_fb_block_table_capacity_ = 0;
+    int64_t decode_fb_next_token_capacity_ = 0;
 
     struct GraphData
     {

@@ -1,8 +1,11 @@
 #include "firefly/tokenizer.h"
 
+#include <algorithm>
+#include <cctype>
 #include <fstream>
 #include <iostream>
 #include <nlohmann/json.hpp>
+#include <stdexcept>
 
 using json = nlohmann::json;
 
@@ -30,17 +33,26 @@ bool Tokenizer::load(const std::string& path)
             std::string token = it.key();
             int         id = it.value();
 
-            // Qwen tokenizer byte fallback replacement
-            // In a complete implementation we would apply the BPE byte decoder.
-            // For now, mapping literal tokens.
-
-            // Handling basic spaces (Qwen uses Ġ or similar depending on the exact tokenizer version,
-            // but Qwen2/3 use standard BPE with byte fallback replacing spaces).
-            // This is a simplified decode that won't be perfect for all unicode but works for demo.
-
             id_to_token_[id] = token;
             token_to_id_[token] = id;
         }
+
+        if (j.contains("added_tokens") && j["added_tokens"].is_array())
+        {
+            for (const auto& item : j["added_tokens"])
+            {
+                if (!item.contains("content") || !item.contains("id")) continue;
+
+                std::string token = item["content"].get<std::string>();
+                int         id = item["id"].get<int>();
+                id_to_token_[id] = token;
+                token_to_id_[token] = id;
+                special_tokens_.push_back(token);
+            }
+        }
+
+        std::sort(special_tokens_.begin(), special_tokens_.end(),
+                  [](const auto& a, const auto& b) { return a.size() > b.size(); });
 
         if (j["model"].contains("merges"))
         {
@@ -75,6 +87,111 @@ std::vector<int> Tokenizer::encode(const std::string& text) const
 {
     std::vector<int> ids;
     if (text.empty()) return ids;
+
+    size_t pos = 0;
+    while (pos < text.size())
+    {
+        std::string special;
+        int         special_id = -1;
+        if (match_special_token(text, pos, special, special_id))
+        {
+            ids.push_back(special_id);
+            pos += special.size();
+            continue;
+        }
+
+        size_t next = pos + 1;
+        while (next < text.size())
+        {
+            if (match_special_token(text, next, special, special_id)) break;
+            ++next;
+        }
+        encode_pretokenized_text(text.substr(pos, next - pos), ids);
+        pos = next;
+    }
+
+    return ids;
+}
+
+void Tokenizer::encode_pretokenized_text(const std::string& text, std::vector<int>& ids) const
+{
+    size_t pos = 0;
+    while (pos < text.size())
+    {
+        unsigned char c = static_cast<unsigned char>(text[pos]);
+
+        size_t start = pos;
+        if (std::isspace(c))
+        {
+            while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos])))
+            {
+                ++pos;
+            }
+            if (pos < text.size() && text[pos - 1] == ' ')
+            {
+                unsigned char next = static_cast<unsigned char>(text[pos]);
+                if (!std::isspace(next))
+                {
+                    continue;
+                }
+            }
+        }
+        else
+        {
+            if (pos > 0 && text[pos - 1] == ' ')
+            {
+                --start;
+            }
+
+            if (std::isalpha(c))
+            {
+                ++pos;
+                while (pos < text.size() && std::isalpha(static_cast<unsigned char>(text[pos])))
+                {
+                    ++pos;
+                }
+            }
+            else if (std::isdigit(c))
+            {
+                ++pos;
+                while (pos < text.size() && std::isdigit(static_cast<unsigned char>(text[pos])))
+                {
+                    ++pos;
+                }
+            }
+            else if ((c & 0x80) == 0)
+            {
+                ++pos;
+                while (pos < text.size())
+                {
+                    unsigned char next = static_cast<unsigned char>(text[pos]);
+                    if (std::isspace(next) || std::isalpha(next) || std::isdigit(next) || (next & 0x80) != 0)
+                    {
+                        break;
+                    }
+                    ++pos;
+                }
+            }
+            else
+            {
+                ++pos;
+                while (pos < text.size() && (static_cast<unsigned char>(text[pos]) & 0xC0) == 0x80)
+                {
+                    ++pos;
+                }
+            }
+        }
+
+        if (pos > start)
+        {
+            encode_normal_text(text.substr(start, pos - start), ids);
+        }
+    }
+}
+
+void Tokenizer::encode_normal_text(const std::string& text, std::vector<int>& ids) const
+{
+    if (text.empty()) return;
 
     // 1. Convert string to BPE bytes utilizing the byte encoder
     std::vector<std::string> bpe_chars;
@@ -127,22 +244,37 @@ std::vector<int> Tokenizer::encode(const std::string& text) const
         }
         else
         {
-            // Fallback to unknown or special mappings if needed
-            // Qwen commonly uses <|im_start|> etc, but for raw bytes they should all map
+            size_t i = 0;
+            while (i < token_str.size())
+            {
+                unsigned char c = token_str[i];
+                size_t        len = 1;
+                if ((c & 0x80) == 0)
+                    len = 1;
+                else if ((c & 0xE0) == 0xC0)
+                    len = 2;
+                else if ((c & 0xF0) == 0xE0)
+                    len = 3;
+                else if ((c & 0xF8) == 0xF0)
+                    len = 4;
+
+                if (i + len > token_str.size()) len = token_str.size() - i;
+
+                std::string piece = token_str.substr(i, len);
+                auto        piece_it = token_to_id_.find(piece);
+                if (piece_it == token_to_id_.end())
+                {
+                    throw std::runtime_error("Tokenizer cannot map BPE token: " + token_str);
+                }
+                ids.push_back(piece_it->second);
+                i += len;
+            }
         }
     }
-
-    return ids;
 }
 
 std::string Tokenizer::decode(int id) const
 {
-    if (id == 151667) return "<think>";
-    if (id == 151668) return "</think>";
-    if (id == 151643) return "<|endoftext|>";
-    if (id == 151644) return "<|im_start|>";
-    if (id == 151645) return "<|im_end|>";
-
     auto it = id_to_token_.find(id);
     if (it != id_to_token_.end())
     {
@@ -191,6 +323,33 @@ std::string Tokenizer::decode(const std::vector<int>& ids) const
         result += decode(id);
     }
     return result;
+}
+
+int Tokenizer::token_id(const std::string& token) const
+{
+    auto it = token_to_id_.find(token);
+    if (it == token_to_id_.end())
+    {
+        throw std::runtime_error("Tokenizer missing token: " + token);
+    }
+    return it->second;
+}
+
+bool Tokenizer::has_token(const std::string& token) const { return token_to_id_.find(token) != token_to_id_.end(); }
+
+bool Tokenizer::match_special_token(const std::string& text, size_t pos, std::string& token, int& id) const
+{
+    for (const auto& candidate : special_tokens_)
+    {
+        if (candidate.empty() || pos + candidate.size() > text.size()) continue;
+        if (text.compare(pos, candidate.size(), candidate) == 0)
+        {
+            token = candidate;
+            id = token_to_id_.at(candidate);
+            return true;
+        }
+    }
+    return false;
 }
 
 void Tokenizer::init_byte_encoder()

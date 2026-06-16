@@ -41,6 +41,8 @@ public:
     template <typename T, size_t Rank>
     auto view() const
     {
+        using extents_type = firefly::dextents<int64_t, Rank>;
+
         if (shape_.size() != Rank)
         {
             throw std::runtime_error("Tensor rank mismatch in view()");
@@ -48,14 +50,13 @@ public:
 
         std::array<int64_t, Rank> extents_arr;
         std::ranges::copy_n(shape_.begin(), Rank, extents_arr.begin());
-        auto extents = firefly::dextents<int64_t, Rank>(extents_arr);
+        auto extents = extents_type(extents_arr);
 
         std::array<int64_t, Rank> strides_arr;
         std::ranges::copy_n(strides_.begin(), Rank, strides_arr.begin());
-        auto mapping = firefly::layout_stride::mapping(extents, strides_arr);
+        auto mapping = firefly::layout_stride::mapping<extents_type>(extents, strides_arr);
 
-        return firefly::mdspan<T, firefly::dextents<int64_t, Rank>, firefly::layout_stride>(static_cast<T*>(data_ptr_),
-                                                                                            mapping);
+        return firefly::mdspan<T, extents_type, firefly::layout_stride>(static_cast<T*>(data_ptr_), mapping);
     }
 
     template <typename T>
@@ -79,8 +80,8 @@ private:
     std::vector<int64_t> shape_;
     std::vector<int64_t> strides_;
     int64_t              numel_ = 0;
-    DType                dtype_;
-    Device               device_;
+    DType                dtype_ = DType::UNKNOWN;
+    Device               device_ = Device::CPU;
     bool                 is_view_ = false;
 };
 

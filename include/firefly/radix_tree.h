@@ -54,7 +54,7 @@ public:
      * @param tokens The full sequence of tokens to insert.
      * @param blocks The corresponding block indices.
      */
-    void insert(const std::vector<int>& tokens, const std::vector<int>& blocks);
+    int insert(const std::vector<int>& tokens, const std::vector<int>& blocks);
 
     /**
      * @brief Decrements the ref_count of given nodes.

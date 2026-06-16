@@ -44,11 +44,14 @@ public:
      */
     std::string decode(const std::vector<int>& ids) const;
 
-    int vocab_size() const { return id_to_token_.size(); }
+    int  vocab_size() const { return id_to_token_.size(); }
+    int  token_id(const std::string& token) const;
+    bool has_token(const std::string& token) const;
 
 private:
     std::unordered_map<int, std::string> id_to_token_;
     std::unordered_map<std::string, int> token_to_id_;
+    std::vector<std::string>             special_tokens_;
 
     /** @brief BPE Merges */
     std::unordered_map<std::string, int> merge_ranks_;
@@ -58,6 +61,9 @@ private:
     std::unordered_map<std::string, unsigned char> byte_decoder_;
 
     void init_byte_encoder();
+    void encode_pretokenized_text(const std::string& text, std::vector<int>& ids) const;
+    void encode_normal_text(const std::string& text, std::vector<int>& ids) const;
+    bool match_special_token(const std::string& text, size_t pos, std::string& token, int& id) const;
 };
 
 }  // namespace firefly

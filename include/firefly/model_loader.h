@@ -3,6 +3,7 @@
 #include <cuda_fp16.h>
 
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -67,7 +68,14 @@ public:
             for (const auto& name : keys)
             {
                 Tensor cpu_tensor = loader.get_tensor(name);
+                DType  dtype = cpu_tensor.dtype();
                 size_t bytes = cpu_tensor.nbytes();
+
+                if (bytes == 0)
+                {
+                    return hal::unexpected(
+                        hal::Error{-1, hal::ErrorCategory::Runtime, "Unsupported tensor dtype for tensor: " + name});
+                }
 
                 void* d_ptr = pool.allocate(bytes, options.alignment);
                 if (!d_ptr)
@@ -76,33 +84,12 @@ public:
                         hal::Error{cudaErrorMemoryAllocation, "Failed to allocate memory for tensor: " + name});
                 }
 
-                if (cpu_tensor.dtype() == DType::BF16)
-                {
-                    // Convert BF16 to FP16
-                    size_t            count = cpu_tensor.numel();
-                    std::vector<half> fp16_data(count);
-                    const uint16_t*   src = reinterpret_cast<const uint16_t*>(cpu_tensor.data());
+                cudaError_t err =
+                    cudaMemcpyAsync(d_ptr, cpu_tensor.data(), bytes, cudaMemcpyHostToDevice, stream.get());
+                if (err != cudaSuccess)
+                    return hal::unexpected(hal::Error{err, "Failed to copy tensor to device: " + name});
 
-                    for (size_t i = 0; i < count; ++i)
-                    {
-                        uint32_t temp = static_cast<uint32_t>(src[i]) << 16;
-                        float    f;
-                        std::memcpy(&f, &temp, sizeof(float));
-                        fp16_data[i] = __float2half(f);
-                    }
-
-                    cudaError_t err = cudaMemcpy(d_ptr, fp16_data.data(), bytes, cudaMemcpyHostToDevice);
-                    if (err != cudaSuccess)
-                        return hal::unexpected(hal::Error{err, "Failed to copy tensor to device: " + name});
-                }
-                else
-                {
-                    cudaError_t err = cudaMemcpy(d_ptr, cpu_tensor.data(), bytes, cudaMemcpyHostToDevice);
-                    if (err != cudaSuccess)
-                        return hal::unexpected(hal::Error{err, "Failed to copy tensor to device: " + name});
-                }
-
-                gpu_tensors.emplace(name, Tensor::from_external(d_ptr, cpu_tensor.shape(), DType::F16, Device::CUDA));
+                gpu_tensors.emplace(name, Tensor::from_external(d_ptr, cpu_tensor.shape(), dtype, Device::CUDA));
             }
 
             cudaError_t err = cudaStreamSynchronize(stream.get());

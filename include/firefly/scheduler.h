@@ -37,6 +37,7 @@ private:
 struct SchedulerBatch
 {
     std::vector<RequestPtr> requests;
+    std::vector<RequestPtr> failed_requests;
 };
 
 class Scheduler
@@ -58,6 +59,7 @@ public:
     SchedulerBatch step();
 
     void finish_request(RequestPtr req);
+    void abort_request(RequestPtr req);
 
     bool has_unfinished_requests();
 
@@ -71,6 +73,8 @@ private:
     int                        block_size_ = 16;
     int                        max_batch_size_limit_ = 64;
     int                        max_prefill_chunk_size_ = 256;
+
+    void release_owned_blocks(RequestPtr req);
 };
 
 }  // namespace firefly

@@ -108,16 +108,23 @@ void RadixTree::decrement_ref_counts(const std::vector<std::shared_ptr<TreeNode>
     }
 }
 
-void RadixTree::insert(const std::vector<int>& tokens, const std::vector<int>& blocks)
+int RadixTree::insert(const std::vector<int>& tokens, const std::vector<int>& blocks)
 {
     std::lock_guard<std::mutex> lock(mutex_);
     current_time_++;
+
+    int cacheable_blocks = std::min<int>(blocks.size(), tokens.size() / 16);
+    int cacheable_tokens = cacheable_blocks * 16;
+    if (cacheable_blocks == 0)
+    {
+        return 0;
+    }
 
     std::shared_ptr<TreeNode> current = root_;
     int                       token_idx = 0;
     int                       block_idx = 0;
 
-    while (token_idx < (int)tokens.size())
+    while (token_idx < cacheable_tokens)
     {
         int next_token = tokens[token_idx];
         if (current->children.find(next_token) == current->children.end())
@@ -128,20 +135,24 @@ void RadixTree::insert(const std::vector<int>& tokens, const std::vector<int>& b
         auto child = current->children[next_token];
 
         int match_len = 0;
-        int max_match = std::min(child->tokens.size(), tokens.size() - token_idx);
+        int max_match = std::min<int>(child->tokens.size(), cacheable_tokens - token_idx);
         while (match_len < max_match && child->tokens[match_len] == tokens[token_idx + match_len])
         {
             match_len++;
         }
 
-        // SGLANG NODE SPLIT
         if (match_len < (int)child->tokens.size())
         {
-            auto new_child = std::make_shared<TreeNode>();
-            new_child->tokens = std::vector<int>(child->tokens.begin() + match_len, child->tokens.end());
+            int block_aligned_match = (match_len / 16) * 16;
+            if (block_aligned_match == 0)
+            {
+                return block_idx;
+            }
 
-            // Assume 16 tokens = 1 block
-            int blocks_before_split = (match_len + 15) / 16;
+            auto new_child = std::make_shared<TreeNode>();
+            new_child->tokens = std::vector<int>(child->tokens.begin() + block_aligned_match, child->tokens.end());
+
+            int blocks_before_split = block_aligned_match / 16;
 
             if (blocks_before_split < (int)child->block_indices.size())
             {
@@ -154,30 +165,38 @@ void RadixTree::insert(const std::vector<int>& tokens, const std::vector<int>& b
             new_child->ref_count.store(child->ref_count.load());
             new_child->last_access_time = child->last_access_time;
 
-            child->tokens.resize(match_len);
+            child->tokens.resize(block_aligned_match);
             child->children.clear();
             child->children[new_child->tokens[0]] = new_child;
+
+            token_idx += block_aligned_match;
+            block_idx += blocks_before_split;
+            current = child;
+            continue;
         }
 
         token_idx += match_len;
-        block_idx += (match_len + 15) / 16;
+        block_idx += match_len / 16;
         current = child;
     }
 
     // Insert new suffix if any
-    if (token_idx < (int)tokens.size())
+    if (token_idx < cacheable_tokens)
     {
         auto new_node = std::make_shared<TreeNode>();
-        new_node->tokens = std::vector<int>(tokens.begin() + token_idx, tokens.end());
+        new_node->tokens = std::vector<int>(tokens.begin() + token_idx, tokens.begin() + cacheable_tokens);
 
-        if (block_idx < (int)blocks.size())
+        if (block_idx < cacheable_blocks)
         {
-            new_node->block_indices = std::vector<int>(blocks.begin() + block_idx, blocks.end());
+            new_node->block_indices = std::vector<int>(blocks.begin() + block_idx, blocks.begin() + cacheable_blocks);
         }
 
         new_node->last_access_time = current_time_;
         current->children[new_node->tokens[0]] = new_node;
+        return cacheable_blocks;
     }
+
+    return block_idx;
 }
 
 void RadixTree::collect_evictable_leaves(

@@ -57,7 +57,9 @@ public:
     void load_weights(std::unordered_map<std::string, Tensor>& weights) override;
 
     Tensor forward(const Tensor& input_ids, const Tensor& context_lens, std::vector<Tensor>& k_caches,
-                   std::vector<Tensor>& v_caches, int* block_table, int max_blocks) override;
+                   std::vector<Tensor>& v_caches, int* block_table, int max_blocks,
+                   bool compute_logits = true, bool prefer_split_decode = false,
+                   int max_decode_context_len = 0, int min_context_len = -1) override;
 };
 
 }  // namespace firefly::model

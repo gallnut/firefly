@@ -13,6 +13,19 @@ include(CXXConf)
 include(CUDAConf)
 include(Deps)
 
+option(FIREFLY_USE_TORCH_SDPA "Use PyTorch CUDA flash attention for external SDPA backend" ON)
+if(FIREFLY_USE_TORCH_SDPA)
+    set(FIREFLY_TORCH_ROOT "${CMAKE_SOURCE_DIR}/.venv/lib/python3.12/site-packages/torch")
+    set(FIREFLY_TORCH_LIB_DIR "${FIREFLY_TORCH_ROOT}/lib")
+    if(EXISTS "${FIREFLY_TORCH_LIB_DIR}/libtorch_cuda.so")
+        message(STATUS "Firefly Torch SDPA backend enabled")
+        set(Torch_FOUND TRUE)
+    else()
+        message(WARNING "Firefly Torch SDPA backend requested but venv Torch CUDA libraries were not found; disabling")
+        set(FIREFLY_USE_TORCH_SDPA OFF)
+    endif()
+endif()
+
 # Disable bleeding edge SM100 support which breaks on non-Blackwell
 string(REPLACE "-DCUTLASS_SM100_FAMILY_ARCHS_ENABLED" "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
 add_compile_options(
@@ -29,6 +42,3 @@ add_subdirectory(src)
 #     enable_testing()
 #     add_subdirectory(test)
 # endif()
-
-# Force standard architectures for safety
-set(CMAKE_CUDA_ARCHITECTURES "native")
