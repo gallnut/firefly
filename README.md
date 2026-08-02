@@ -56,7 +56,8 @@ Prerequisites
 
 - CMake: >= 3.35
 
-- CUDA Toolkit: >= 12.0 (Targeting compute capability sm_89 by default. Adjust in .clangd and cmake/Deps.cmake if needed).
+- CUDA Toolkit: >= 12.0. Firefly builds for the local GPU by default; use the standard
+  `-DCMAKE_CUDA_ARCHITECTURES=<arch>` option for cross-compilation or release builds.
 
 - Compiler: A C++23 compatible compiler (e.g., GCC 13+, Clang 16+).
 
@@ -71,13 +72,14 @@ Firefly uses CPM (CMake Package Manager) to handle dependencies automatically.
 git clone [https://github.com/yourusername/firefly.git](https://github.com/yourusername/firefly.git)
 cd firefly
 
-# Create build directory
-mkdir build && cd build
-
 # Configure and compile
-cmake ..
-make -j$(nproc)
+cmake -S . -B build
+cmake --build build -j$(nproc)
 ```
+
+FlashInfer is downloaded by CPM when enabled. Use `-DFIREFLY_USE_FLASHINFER=OFF` for Firefly's native attention path,
+`-DFIREFLY_FLASHINFER_SOURCE_DIR=/path/to/flashinfer` when developing against a local FlashInfer checkout, and
+`-DFIREFLY_BUILD_SERVER=OFF` when gRPC and Protobuf are not needed.
 
 ## 🚀 Usage
 
@@ -85,7 +87,7 @@ make -j$(nproc)
 
 Run the firefly_server executable, pointing it to the directory containing your model's config.json, tokenizer.json, and model.safetensors files.
 ```bash
-./bin/firefly_server /path/to/qwen3/model_dir
+./build/bin/firefly_server /path/to/qwen3/model_dir
 ```
 
 Optional argument: --max-prefill-chunk-size <size> to configure the prefill chunking limit.

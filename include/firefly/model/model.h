@@ -2,9 +2,8 @@
 
 #include <string>
 #include <unordered_map>
-#include <vector>
-
-#include "firefly/tensor.h"
+#include "firefly/model/forward_context.h"
+#include "firefly/core/tensor.h"
 
 namespace firefly::model
 {
@@ -33,20 +32,7 @@ public:
 
     virtual void load_weights(std::unordered_map<std::string, Tensor>& weights) = 0;
 
-    /**
-     * @brief Forward pass for the model.
-     * @param input_ids Token IDs of shape [batch_size, seq_len]
-     * @param context_lens Tensor of shape [batch_size] containing the current context length for each sequence
-     * @param k_caches K cache blocks of shape [num_layers, max_blocks, 16, num_kv_heads, head_dim]
-     * @param v_caches V cache blocks of shape [num_layers, max_blocks, 16, num_kv_heads, head_dim]
-     * @param block_table Block table for paged attention
-     * @param max_blocks Maximum number of blocks per sequence
-     * @return Tensor shape [batch_size, seq_len, vocab_size] representing logits.
-     */
-    virtual Tensor forward(const Tensor& input_ids, const Tensor& context_lens, std::vector<Tensor>& k_caches,
-                           std::vector<Tensor>& v_caches, int* block_table, int max_blocks,
-                           bool compute_logits = true, bool prefer_split_decode = false,
-                           int max_decode_context_len = 0, int min_context_len = -1) = 0;
+    virtual Tensor forward(const ModelInput& input, const ForwardOptions& options = {}) = 0;
 };
 
 }  // namespace firefly::model

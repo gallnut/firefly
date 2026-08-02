@@ -1,0 +1,9 @@
+#include "firefly/model/registry.h"
+
+namespace firefly::model
+{
+@registrar_declarations@
+void register_builtin_models(ModelRegistry& registry)
+{
+@registrar_calls@}
+}  // namespace firefly::model

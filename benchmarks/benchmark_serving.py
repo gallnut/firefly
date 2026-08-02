@@ -19,6 +19,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "../example"))
 grpc: Any = None
 firefly_pb2: Any = None
 firefly_pb2_grpc: Any = None
+aiohttp: Any = None
 
 
 def ensure_grpc_modules() -> None:
@@ -43,6 +44,16 @@ def ensure_grpc_modules() -> None:
             ) from exc
         firefly_pb2 = pb2_module
         firefly_pb2_grpc = pb2_grpc_module
+
+
+def ensure_aiohttp_module() -> None:
+    global aiohttp
+    if aiohttp is None:
+        try:
+            import aiohttp as aiohttp_module
+        except ImportError as exc:
+            raise RuntimeError("Python package aiohttp is required for --backend openai.") from exc
+        aiohttp = aiohttp_module
 
 
 BUILTIN_PROMPTS = [
@@ -396,6 +407,186 @@ def usage_counts(response: Any) -> tuple[int, int] | None:
     return prompt_tokens, completion_tokens
 
 
+def build_openai_payload(args: argparse.Namespace, spec: RequestSpec) -> dict[str, Any]:
+    messages: list[dict[str, str]] = []
+    if args.system_prompt:
+        messages.append({"role": "system", "content": args.system_prompt})
+    messages.extend(spec.sample.messages)
+    payload = {
+        "model": args.model,
+        "messages": messages,
+        "max_tokens": spec.max_tokens,
+        "temperature": 0.0,
+        "stream": args.stream,
+        "ignore_eos": True,
+    }
+    if args.stream:
+        payload["stream_options"] = {"include_usage": True}
+    return payload
+
+
+def openai_piece(payload: dict[str, Any]) -> tuple[str, int]:
+    pieces: list[str] = []
+    reasoning_chars = 0
+    for choice in payload.get("choices") or []:
+        delta = choice.get("delta") or {}
+        reasoning = delta.get("reasoning_content") or ""
+        content = delta.get("content") or ""
+        if reasoning:
+            reasoning_chars += len(reasoning)
+            pieces.append(reasoning)
+        if content:
+            pieces.append(content)
+    return "".join(pieces), reasoning_chars
+
+
+def openai_usage(payload: dict[str, Any]) -> tuple[int, int] | None:
+    usage = payload.get("usage") or {}
+    prompt_tokens = int(usage.get("prompt_tokens") or 0)
+    completion_tokens = int(usage.get("completion_tokens") or 0)
+    if prompt_tokens <= 0 and completion_tokens <= 0:
+        return None
+    return prompt_tokens, completion_tokens
+
+
+async def run_openai_stream_request(
+    session: Any,
+    args: argparse.Namespace,
+    spec: RequestSpec,
+) -> RequestResult:
+    started = time.perf_counter()
+    first_piece_at: float | None = None
+    piece_times: list[float] = []
+    output_parts: list[str] = []
+    reasoning_chars = 0
+    usage_prompt_tokens: int | None = None
+    usage_completion_tokens: int | None = None
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=args.timeout)
+        async with session.post(
+            f"{args.base_url.rstrip('/')}/chat/completions",
+            json=build_openai_payload(args, spec),
+            timeout=timeout,
+        ) as response:
+            if response.status != 200:
+                body = await response.text()
+                raise RuntimeError(f"HTTP {response.status}: {body[:1000]}")
+
+            buffer = b""
+            async for chunk in response.content.iter_any():
+                buffer += chunk
+                while b"\n\n" in buffer:
+                    event, buffer = buffer.split(b"\n\n", 1)
+                    for line in event.splitlines():
+                        if not line.startswith(b"data:"):
+                            continue
+                        data = line[5:].strip()
+                        if not data or data == b"[DONE]":
+                            continue
+                        payload = json.loads(data)
+                        usage = openai_usage(payload)
+                        if usage is not None:
+                            usage_prompt_tokens, usage_completion_tokens = usage
+                        piece, piece_reasoning_chars = openai_piece(payload)
+                        if not piece:
+                            continue
+                        now = time.perf_counter()
+                        if first_piece_at is None:
+                            first_piece_at = now
+                        piece_times.append(now)
+                        output_parts.append(piece)
+                        reasoning_chars += piece_reasoning_chars
+
+        ended = time.perf_counter()
+        text = "".join(output_parts)
+        completion_tokens = usage_completion_tokens or estimate_tokens(text)
+        prompt_tokens = usage_prompt_tokens or spec.sample.approx_input_tokens
+        ttft_s = first_piece_at - started if first_piece_at is not None else None
+        tpot_s = None
+        if ttft_s is not None and completion_tokens > 1:
+            tpot_s = max(0.0, ended - started - ttft_s) / (completion_tokens - 1)
+        inter_chunks = [piece_times[index] - piece_times[index - 1] for index in range(1, len(piece_times))]
+        return RequestResult(
+            request_id=spec.request_id,
+            prompt_id=spec.sample.sample_id,
+            success=True,
+            latency_s=ended - started,
+            ttft_s=ttft_s,
+            tpot_s=tpot_s,
+            mean_inter_chunk_s=statistics.mean(inter_chunks) if inter_chunks else None,
+            output_chunks=len(piece_times),
+            output_chars=len(text),
+            reasoning_chars=reasoning_chars,
+            completion_tokens=completion_tokens,
+            prompt_tokens=prompt_tokens,
+            token_count_source="usage" if usage_completion_tokens is not None else "estimated",
+            max_tokens=spec.max_tokens,
+            response_text=text if args.save_responses else None,
+        )
+    except Exception as exc:
+        return RequestResult(
+            request_id=spec.request_id,
+            prompt_id=spec.sample.sample_id,
+            success=False,
+            error=str(exc),
+            grpc_code=type(exc).__name__,
+            latency_s=time.perf_counter() - started,
+            prompt_tokens=spec.sample.approx_input_tokens,
+            max_tokens=spec.max_tokens,
+        )
+
+
+async def run_openai_unary_request(
+    session: Any,
+    args: argparse.Namespace,
+    spec: RequestSpec,
+) -> RequestResult:
+    started = time.perf_counter()
+    try:
+        timeout = aiohttp.ClientTimeout(total=args.timeout)
+        async with session.post(
+            f"{args.base_url.rstrip('/')}/chat/completions",
+            json=build_openai_payload(args, spec),
+            timeout=timeout,
+        ) as response:
+            payload = await response.json()
+            if response.status != 200:
+                raise RuntimeError(f"HTTP {response.status}: {payload}")
+        ended = time.perf_counter()
+        message = (payload.get("choices") or [{}])[0].get("message") or {}
+        reasoning = message.get("reasoning_content") or ""
+        content = message.get("content") or ""
+        text = reasoning + content
+        usage = openai_usage(payload)
+        prompt_tokens, completion_tokens = usage or (spec.sample.approx_input_tokens, estimate_tokens(text))
+        return RequestResult(
+            request_id=spec.request_id,
+            prompt_id=spec.sample.sample_id,
+            success=True,
+            latency_s=ended - started,
+            output_chunks=1 if text else 0,
+            output_chars=len(text),
+            reasoning_chars=len(reasoning),
+            completion_tokens=completion_tokens,
+            prompt_tokens=prompt_tokens,
+            token_count_source="usage" if usage is not None else "estimated",
+            max_tokens=spec.max_tokens,
+            response_text=text if args.save_responses else None,
+        )
+    except Exception as exc:
+        return RequestResult(
+            request_id=spec.request_id,
+            prompt_id=spec.sample.sample_id,
+            success=False,
+            error=str(exc),
+            grpc_code=type(exc).__name__,
+            latency_s=time.perf_counter() - started,
+            prompt_tokens=spec.sample.approx_input_tokens,
+            max_tokens=spec.max_tokens,
+        )
+
+
 async def run_stream_request(
     stub: Any,
     args: argparse.Namespace,
@@ -546,6 +737,10 @@ async def run_unary_request(
 
 
 async def run_one(stub: Any, args: argparse.Namespace, spec: RequestSpec) -> RequestResult:
+    if args.backend == "openai":
+        if args.stream:
+            return await run_openai_stream_request(stub, args, spec)
+        return await run_openai_unary_request(stub, args, spec)
     if args.stream:
         return await run_stream_request(stub, args, spec)
     return await run_unary_request(stub, args, spec)
@@ -583,18 +778,8 @@ async def run_warmup(stub: Any, args: argparse.Namespace, specs: list[RequestSpe
 
 
 async def run_benchmark(args: argparse.Namespace, specs: list[RequestSpec]) -> tuple[list[RequestResult], float]:
-    ensure_grpc_modules()
-    address = args.address or f"{args.host}:{args.port}"
-    options = [
-        ("grpc.max_receive_message_length", args.max_message_mb * 1024 * 1024),
-        ("grpc.max_send_message_length", args.max_message_mb * 1024 * 1024),
-    ]
-
-    async with grpc.aio.insecure_channel(address, options=options) as channel:
-        await asyncio.wait_for(channel.channel_ready(), timeout=args.connect_timeout)
-        stub = firefly_pb2_grpc.InferenceServiceStub(channel)
-
-        warmup_failures = await run_warmup(stub, args, specs)
+    async def run_with_client(client: Any) -> tuple[list[RequestResult], float]:
+        warmup_failures = await run_warmup(client, args, specs)
         if warmup_failures and not args.continue_on_warmup_failure:
             first = warmup_failures[0]
             raise RuntimeError(
@@ -608,7 +793,7 @@ async def run_benchmark(args: argparse.Namespace, specs: list[RequestSpec]) -> t
         async def guarded_run(spec: RequestSpec) -> RequestResult:
             nonlocal completed
             async with semaphore:
-                result = await run_one(stub, args, spec)
+                result = await run_one(client, args, spec)
             completed += 1
             if args.progress_interval and completed % args.progress_interval == 0:
                 print(f"completed {completed}/{len(specs)}")
@@ -625,6 +810,30 @@ async def run_benchmark(args: argparse.Namespace, specs: list[RequestSpec]) -> t
         results = await asyncio.gather(*tasks)
         elapsed = time.perf_counter() - started
         return results, elapsed
+
+    if args.backend == "openai":
+        ensure_aiohttp_module()
+        connector = aiohttp.TCPConnector(limit=max(args.concurrency, 1))
+        async with aiohttp.ClientSession(connector=connector) as session:
+            try:
+                timeout = aiohttp.ClientTimeout(total=args.connect_timeout)
+                async with session.get(f"{args.base_url.rstrip('/')}/models", timeout=timeout) as response:
+                    if response.status != 200:
+                        raise RuntimeError(f"OpenAI server readiness check failed: HTTP {response.status}")
+            except Exception as exc:
+                raise RuntimeError(f"OpenAI server is not ready at {args.base_url}: {exc}") from exc
+            return await run_with_client(session)
+
+    ensure_grpc_modules()
+    address = args.address or f"{args.host}:{args.port}"
+    options = [
+        ("grpc.max_receive_message_length", args.max_message_mb * 1024 * 1024),
+        ("grpc.max_send_message_length", args.max_message_mb * 1024 * 1024),
+    ]
+    async with grpc.aio.insecure_channel(address, options=options) as channel:
+        await asyncio.wait_for(channel.channel_ready(), timeout=args.connect_timeout)
+        stub = firefly_pb2_grpc.InferenceServiceStub(channel)
+        return await run_with_client(stub)
 
 
 def summarize(results: list[RequestResult], elapsed_s: float) -> dict[str, Any]:
@@ -731,7 +940,7 @@ def print_dry_run(
 
 
 def print_summary(args: argparse.Namespace, source_name: str, samples: list[PromptSample], summary: dict[str, Any]) -> None:
-    address = args.address or f"{args.host}:{args.port}"
+    address = args.base_url if args.backend == "openai" else (args.address or f"{args.host}:{args.port}")
     token_sources = set(summary["token_count_sources"])
     if token_sources == {"usage"}:
         token_note = "actual"
@@ -740,7 +949,8 @@ def print_summary(args: argparse.Namespace, source_name: str, samples: list[Prom
     else:
         token_note = "estimated/actual"
 
-    print("\n--- Firefly gRPC Serving Benchmark ---")
+    backend_name = "OpenAI HTTP" if args.backend == "openai" else "Firefly gRPC"
+    print(f"\n--- {backend_name} Serving Benchmark ---")
     print(f"Target:              {address}")
     print(f"Model:               {args.model}")
     print(f"Mode:                {'stream' if args.stream else 'unary'}")
@@ -794,12 +1004,14 @@ def write_json(path: str, args: argparse.Namespace, source_name: str, summary: d
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Benchmark Firefly gRPC serving with varied prompts and concurrency.",
+        description="Benchmark Firefly gRPC or OpenAI-compatible serving with varied prompts and concurrency.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--host", default="localhost", help="Server host.")
     parser.add_argument("--port", type=int, default=50051, help="Server port.")
     parser.add_argument("--address", help="Override host/port with an address such as localhost:50051.")
+    parser.add_argument("--backend", choices=["grpc", "openai"], default="grpc", help="Serving protocol backend.")
+    parser.add_argument("--base-url", default="http://127.0.0.1:8000/v1", help="OpenAI-compatible API base URL.")
     parser.add_argument("--model", default="qwen3", help="Model name sent in requests.")
     parser.add_argument("-n", "--num-requests", type=int, default=64, help="Total measured requests.")
     parser.add_argument("-c", "--concurrency", type=int, default=8, help="Maximum in-flight requests.")
