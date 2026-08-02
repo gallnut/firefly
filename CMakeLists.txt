@@ -3,32 +3,29 @@ cmake_minimum_required(VERSION 3.35)
 project(firefly VERSION 0.1.0 LANGUAGES CXX CUDA)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-set(EXECUTABLE_OUTPUT_PATH ${PROJECT_SOURCE_DIR}/bin)
-set(LIBRARY_OUTPUT_PATH ${PROJECT_SOURCE_DIR}/lib)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 
 include(CPM)
-include(CXXConf)
-include(CUDAConf)
-include(Deps)
+include(Compile)
+include(Targets)
 
-# Disable bleeding edge SM100 support which breaks on non-Blackwell
-string(REPLACE "-DCUTLASS_SM100_FAMILY_ARCHS_ENABLED" "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
-add_compile_options(
-    $<$<COMPILE_LANGUAGE:CUDA>:-UCUTLASS_SM100_FAMILY_ARCHS_ENABLED>
-    $<$<COMPILE_LANGUAGE:CUDA>:-UCUTLASS_SM100_SUPPORT_ENABLED>
-)
-add_compile_definitions(CUTLASS_SM100_SUPPORT_DISABLED)
+option(FIREFLY_BUILD_SERVER "Build the gRPC serving binary" ON)
+option(FIREFLY_USE_FLASHINFER "Use FlashInfer paged decode attention" ON)
+include(CTest)
+
+cmake_policy(PUSH)
+if(POLICY CMP0169)
+    cmake_policy(SET CMP0169 OLD)
+endif()
+include(Deps)
+cmake_policy(POP)
 
 add_subdirectory(src)
 
-# option(BUILD_TESTS "Build tests" ON)
-
-# if (BUILD_TESTS)
-#     enable_testing()
-#     add_subdirectory(test)
-# endif()
-
-# Force standard architectures for safety
-set(CMAKE_CUDA_ARCHITECTURES "native")
+if(BUILD_TESTING)
+    add_subdirectory(tests)
+endif()

@@ -58,4 +58,5 @@ message ChatCompletionStreamResponse {
   int64 created = 3;
   string model = 4;
   repeated StreamChoice choices = 5;
+  Usage usage = 6;
 }

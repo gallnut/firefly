@@ -1,0 +1,37 @@
+function(firefly_add_object_module target_name)
+    add_library(${target_name} OBJECT ${ARGN})
+    target_include_directories(${target_name} PUBLIC "${PROJECT_SOURCE_DIR}/include")
+    target_link_libraries(${target_name} PUBLIC firefly_compile_options mdspan CUDA::cudart)
+    set_target_properties(${target_name} PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+    )
+endfunction()
+
+function(firefly_register_model_module target_name registrar_name)
+    if(NOT TARGET ${target_name})
+        message(FATAL_ERROR "Model module target does not exist: ${target_name}")
+    endif()
+    set_property(GLOBAL APPEND PROPERTY FIREFLY_MODEL_MODULES ${target_name})
+    set_property(GLOBAL APPEND PROPERTY FIREFLY_MODEL_REGISTRARS ${registrar_name})
+endfunction()
+
+function(firefly_collect_model_objects output_variable)
+    get_property(model_modules GLOBAL PROPERTY FIREFLY_MODEL_MODULES)
+    set(model_objects "")
+    foreach(model_module IN LISTS model_modules)
+        list(APPEND model_objects "$<TARGET_OBJECTS:${model_module}>")
+    endforeach()
+    set(${output_variable} "${model_objects}" PARENT_SCOPE)
+endfunction()
+
+function(firefly_generate_model_registry output_file)
+    get_property(model_registrars GLOBAL PROPERTY FIREFLY_MODEL_REGISTRARS)
+    set(registrar_declarations "")
+    set(registrar_calls "")
+    foreach(model_registrar IN LISTS model_registrars)
+        string(APPEND registrar_declarations "void ${model_registrar}(ModelRegistry& registry);\n")
+        string(APPEND registrar_calls "    ${model_registrar}(registry);\n")
+    endforeach()
+    configure_file("${PROJECT_SOURCE_DIR}/cmake/ModelRegistry.cc.in" "${output_file}" @ONLY)
+endfunction()
