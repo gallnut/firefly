@@ -1,8 +1,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include <iostream>
 
+#include "firefly/core/logging.h"
 #include "firefly/kernels/detail/cuda_scalar.cuh"
 #include "firefly/kernels/transformer/residual.h"
 
@@ -99,7 +99,8 @@ void add_inplace(Tensor& x, const Tensor& y, const device::Context& context)
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess)
     {
-        std::cerr << "CUDA Error in add_inplace: " << cudaGetErrorString(err) << std::endl;
+        FIREFLY_LOG_ERROR("cuda", "kernel launch failed operation=add_inplace error={} code={}",
+                          cudaGetErrorString(err), static_cast<int>(err));
     }
 }
 

@@ -1,0 +1,5 @@
+firefly_add_object_module(firefly_model_qwen3_5
+    model.cu
+)
+target_link_libraries(firefly_model_qwen3_5 PUBLIC nlohmann_json::nlohmann_json)
+firefly_register_model_module(firefly_model_qwen3_5 register_qwen3_5_models)

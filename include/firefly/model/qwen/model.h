@@ -4,15 +4,11 @@
 #include <unordered_map>
 #include <vector>
 
-#include "firefly/model/model.h"
 #include "firefly/core/tensor.h"
+#include "firefly/model/model.h"
 
 namespace firefly::model::qwen
 {
-
-// Basic Layers
-// In a real implementation, we would define classes for Attention, MLP, RMSNorm, Embedding
-// For now, we store tensors directly in the model or in simplified layer structs.
 
 struct QwenAttention
 {
@@ -45,16 +41,16 @@ class QwenModel : public Model
 public:
     ModelConfig config;
 
-    // Model Weights
     Tensor                 token_embeddings;
     std::vector<QwenLayer> layers;
-    Tensor                 norm;     // Final RMSNorm
-    Tensor                 lm_head;  // Output projection
+    Tensor                 norm;
+    Tensor                 lm_head;
 
     QwenModel(const ModelConfig& cfg);
     ~QwenModel() override = default;
 
     void load_weights(std::unordered_map<std::string, Tensor>& weights) override;
+    [[nodiscard]] ModelRuntimeRequirements runtime_requirements() const override;
 
     Tensor forward(const ModelInput& input, const ForwardOptions& options = {}) override;
 };

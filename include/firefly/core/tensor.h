@@ -37,6 +37,8 @@ public:
     friend std::ostream& operator<<(std::ostream& os, const Tensor& tensor);
 
     static Tensor from_external(void* data_ptr, std::vector<int64_t> shape, DType dtype, Device device);
+    static Tensor from_external(void* data_ptr, std::vector<int64_t> shape, std::vector<int64_t> strides,
+                                DType dtype, Device device);
 
 public:
     template <typename T, size_t Rank>

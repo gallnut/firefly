@@ -1,7 +1,7 @@
 #include "firefly/scheduler/sequence_scheduler.h"
 
 #include <algorithm>
-#include <iostream>
+#include <numeric>
 
 #include "firefly/scheduler/prefix_cache.h"
 
@@ -10,21 +10,27 @@ namespace firefly::scheduler
 
 SequenceScheduler::SequenceScheduler() {}
 
-void SequenceScheduler::init(int max_context_blocks, int max_batch_size_limit, int max_prefill_chunk_size)
+void SequenceScheduler::init(int max_context_blocks, int max_batch_size_limit, int max_prefill_chunk_size,
+                             bool prefix_cache_enabled)
 {
     max_batch_size_limit_ = max_batch_size_limit;
     max_prefill_chunk_size_ = max_prefill_chunk_size;
-    prefix_cache_ = std::make_unique<PrefixCache>(&block_allocator_);
+    prefix_cache_ = prefix_cache_enabled ? std::make_unique<PrefixCache>(&block_allocator_) : nullptr;
     block_allocator_.init(max_context_blocks, prefix_cache_.get());
+    free_state_slots_.resize(max_batch_size_limit_);
+    std::iota(free_state_slots_.rbegin(), free_state_slots_.rend(), 0);
 }
 
 void SequenceScheduler::add_sequence(SequencePtr req)
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    auto                        match = prefix_cache_->match(req->prompt_tokens);
-    req->block_table = match.matched_blocks;
-    req->context_len = match.matched_tokens;
-    req->prefix_cache_nodes = match.matched_nodes;
+    if (prefix_cache_)
+    {
+        auto match = prefix_cache_->match(req->prompt_tokens);
+        req->block_table = match.matched_blocks;
+        req->context_len = match.matched_tokens;
+        req->prefix_cache_nodes = match.matched_nodes;
+    }
     pending_sequences_.push_back(req);
 }
 
@@ -32,6 +38,19 @@ bool SequenceScheduler::has_unfinished_sequences()
 {
     std::lock_guard<std::mutex> lock(mutex_);
     return !pending_sequences_.empty() || !active_sequences_.empty();
+}
+
+bool SequenceScheduler::has_pending_sequences()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return !pending_sequences_.empty();
+}
+
+bool SequenceScheduler::has_active_decode_sequences()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return std::any_of(active_sequences_.begin(), active_sequences_.end(),
+                       [](const SequencePtr& request) { return !request->generated_tokens.empty(); });
 }
 
 BatchPlan SequenceScheduler::step()
@@ -184,10 +203,12 @@ BatchPlan SequenceScheduler::step()
         if (active_sequences_.size() < max_batch_size_limit_)
         {
             std::vector<int> blocks;
-            if (required_blocks == 0 || block_allocator_.allocate(required_blocks, blocks))
+            if (!free_state_slots_.empty() && (required_blocks == 0 || block_allocator_.allocate(required_blocks, blocks)))
             {
                 req->block_table.insert(req->block_table.end(), blocks.begin(), blocks.end());
                 req->owned_blocks.insert(req->owned_blocks.end(), blocks.begin(), blocks.end());
+                req->state_slot = free_state_slots_.back();
+                free_state_slots_.pop_back();
                 req->status = SequenceStatus::ACTIVE;
                 active_sequences_.push_back(req);
                 batch.sequences.push_back(req);
@@ -221,6 +242,14 @@ void SequenceScheduler::release_owned_blocks(SequencePtr req)
     req->prefix_cow_source_block = -1;
     req->prefix_cow_private_block = -1;
     req->prefix_cow_copied = false;
+    release_state_slot(req);
+}
+
+void SequenceScheduler::release_state_slot(SequencePtr req)
+{
+    if (req->state_slot < 0) return;
+    free_state_slots_.push_back(req->state_slot);
+    req->state_slot = -1;
 }
 
 void SequenceScheduler::finish_sequence(SequencePtr req)
@@ -276,6 +305,7 @@ void SequenceScheduler::finish_sequence(SequencePtr req)
     req->prefix_cow_source_block = -1;
     req->prefix_cow_private_block = -1;
     req->prefix_cow_copied = false;
+    release_state_slot(req);
 
     auto it = std::find(active_sequences_.begin(), active_sequences_.end(), req);
     if (it != active_sequences_.end())

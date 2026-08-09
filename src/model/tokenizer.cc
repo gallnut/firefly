@@ -3,11 +3,13 @@
 #include <algorithm>
 #include <cctype>
 #include <fstream>
-#include <iostream>
 #include <nlohmann/json.hpp>
+#include <set>
 #include <stdexcept>
 #include <unicode/regex.h>
 #include <unicode/unistr.h>
+
+#include "firefly/core/logging.h"
 
 using json = nlohmann::json;
 
@@ -21,7 +23,7 @@ bool Tokenizer::load(const std::string& path)
     std::ifstream f(path);
     if (!f.is_open())
     {
-        std::cerr << "Failed to open tokenizer: " << path << std::endl;
+        FIREFLY_LOG_ERROR("tokenizer", "failed to open tokenizer path={}", path);
         return false;
     }
 
@@ -96,7 +98,7 @@ bool Tokenizer::load(const std::string& path)
     }
     catch (const std::exception& e)
     {
-        std::cerr << "Error parsing tokenizer JSON: " << e.what() << std::endl;
+        FIREFLY_LOG_ERROR("tokenizer", "failed to parse tokenizer JSON path={} error={}", path, e.what());
         return false;
     }
 }
@@ -236,37 +238,94 @@ void Tokenizer::encode_normal_text(const std::string& text, std::vector<int>& id
         bpe_chars.push_back(byte_encoder_.at(byte));
     }
 
-    // 2. Iteratively merge the best pairs
-    while (bpe_chars.size() > 1)
+    // 2. Iteratively merge the best pairs with a priority queue.
+    struct BpeNode
     {
-        int         best_rank = 1e9;
-        int         best_idx = -1;
-        std::string best_pair = "";
-
-        for (size_t i = 0; i < bpe_chars.size() - 1; ++i)
+        std::string symbol;
+        int         prev = -1;
+        int         next = -1;
+        int         version = 0;
+        bool        removed = false;
+    };
+    struct BpeEdge
+    {
+        int rank;
+        int start;
+        int end;
+        int start_version;
+        int end_version;
+    };
+    struct BpeEdgeLess
+    {
+        bool operator()(const BpeEdge& a, const BpeEdge& b) const
         {
-            std::string pair = bpe_chars[i] + " " + bpe_chars[i + 1];
-            auto        it = merge_ranks_.find(pair);
-            if (it != merge_ranks_.end())
-            {
-                if (it->second < best_rank)
-                {
-                    best_rank = it->second;
-                    best_idx = i;
-                    best_pair = bpe_chars[i] + bpe_chars[i + 1];
-                }
-            }
+            if (a.rank != b.rank) return a.rank < b.rank;
+            if (a.start != b.start) return a.start < b.start;
+            if (a.end != b.end) return a.end < b.end;
+            if (a.start_version != b.start_version) return a.start_version < b.start_version;
+            return a.end_version < b.end_version;
         }
+    };
 
-        // If no more merges are possible, stop
-        if (best_idx == -1)
+    std::vector<BpeNode> nodes(bpe_chars.size());
+    for (size_t index = 0; index < nodes.size(); ++index)
+    {
+        nodes[index].symbol = bpe_chars[index];
+        nodes[index].prev = static_cast<int>(index) - 1;
+        nodes[index].next = static_cast<int>(index) + 1;
+    }
+
+    auto pair_rank = [&](int left, int right) -> int
+    {
+        if (left < 0 || right < 0 || left >= static_cast<int>(nodes.size()) ||
+            right >= static_cast<int>(nodes.size()))
+            return -1;
+        auto it = merge_ranks_.find(nodes[left].symbol + " " + nodes[right].symbol);
+        return it == merge_ranks_.end() ? -1 : it->second;
+    };
+
+    std::set<BpeEdge, BpeEdgeLess> edges;
+    for (size_t index = 0; index + 1 < nodes.size(); ++index)
+    {
+        const int rank = pair_rank(static_cast<int>(index), static_cast<int>(index + 1));
+        if (rank >= 0) edges.insert({rank, static_cast<int>(index), static_cast<int>(index + 1), 0, 0});
+    }
+
+    while (!edges.empty())
+    {
+        const BpeEdge edge = *edges.begin();
+        edges.erase(edges.begin());
+        if (edge.start < 0 || edge.end < 0 || edge.start >= static_cast<int>(nodes.size()) ||
+            edge.end >= static_cast<int>(nodes.size()))
+            continue;
+
+        BpeNode& start = nodes[edge.start];
+        BpeNode& end = nodes[edge.end];
+        if (start.removed || end.removed || start.next != edge.end || start.version != edge.start_version ||
+            end.version != edge.end_version)
+            continue;
+
+        const int next = end.next;
+        start.symbol += end.symbol;
+        start.next = next;
+        if (next >= 0 && next < static_cast<int>(nodes.size())) nodes[next].prev = edge.start;
+        end.removed = true;
+        ++start.version;
+
+        auto add_edge = [&](int from, int to)
         {
-            break;
-        }
+            const int rank = pair_rank(from, to);
+            if (rank >= 0)
+                edges.insert({rank, from, to, nodes[from].version, nodes[to].version});
+        };
+        add_edge(nodes[edge.start].prev, edge.start);
+        add_edge(edge.start, next);
+    }
 
-        // Merge the best pair
-        bpe_chars[best_idx] = best_pair;
-        bpe_chars.erase(bpe_chars.begin() + best_idx + 1);
+    bpe_chars.clear();
+    for (const BpeNode& node : nodes)
+    {
+        if (!node.removed) bpe_chars.push_back(node.symbol);
     }
 
     // 3. Map final BPE strings to token IDs

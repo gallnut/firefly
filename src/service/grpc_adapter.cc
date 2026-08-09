@@ -5,7 +5,6 @@
 #include <grpcpp/health_check_service_interface.h>
 
 #include <condition_variable>
-#include <iostream>
 #include <memory>
 #include <mutex>
 #include <nlohmann/json.hpp>
@@ -13,6 +12,7 @@
 
 #include "firefly.grpc.pb.h"
 #include "firefly.pb.h"
+#include "firefly/core/logging.h"
 #include "firefly/service/session.h"
 
 using grpc::Server;
@@ -97,6 +97,7 @@ public:
     {
         json req_json;
         if (request->max_tokens() > 0) req_json["max_tokens"] = request->max_tokens();
+        req_json["ignore_eos"] = request->ignore_eos();
         if (!request->model().empty()) req_json["model"] = request->model();
 
         if (request->messages_size() > 0)
@@ -210,6 +211,7 @@ public:
     {
         json req_json;
         if (request->max_tokens() > 0) req_json["max_tokens"] = request->max_tokens();
+        req_json["ignore_eos"] = request->ignore_eos();
         if (!request->model().empty()) req_json["model"] = request->model();
 
         if (request->messages_size() > 0)
@@ -356,7 +358,7 @@ bool GrpcAdapter::start_server(int                                              
     builder.RegisterService(&service);
 
     std::unique_ptr<Server> server(builder.BuildAndStart());
-    std::cout << "Starting gRPC server on " << server_address << "..." << std::endl;
+    FIREFLY_LOG_INFO("service", "gRPC server started address={}", server_address);
     server->Wait();
     return true;
 }

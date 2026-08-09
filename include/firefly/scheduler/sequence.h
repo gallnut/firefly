@@ -24,6 +24,7 @@ struct Sequence
     std::vector<int> prompt_tokens;
     std::vector<int> generated_tokens;
     int              max_tokens;
+    bool             ignore_eos = false;
     SequenceStatus   status = SequenceStatus::PENDING;
     std::string      error_message;
     std::string      utf8_buffer;
@@ -37,15 +38,17 @@ struct Sequence
     int                                    prefix_cow_source_block = -1;
     int                                    prefix_cow_private_block = -1;
     bool                                   prefix_cow_copied = false;
+    int                                    state_slot = -1;
 
     std::chrono::steady_clock::time_point arrival_time;
     std::shared_ptr<std::atomic_bool>     cancel_flag;
 
     Sequence(const std::string& id, const std::vector<int>& tokens, int max_tok,
-             std::shared_ptr<std::atomic_bool> cancel = nullptr)
+             std::shared_ptr<std::atomic_bool> cancel = nullptr, bool ignore_end_token = false)
         : id(id),
           prompt_tokens(tokens),
           max_tokens(max_tok),
+          ignore_eos(ignore_end_token),
           arrival_time(std::chrono::steady_clock::now()),
           cancel_flag(std::move(cancel))
     {

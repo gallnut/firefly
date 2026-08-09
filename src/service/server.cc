@@ -1,7 +1,6 @@
 #include "firefly/service/server.h"
 
 #include <atomic>
-#include <iostream>
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <string>
@@ -9,6 +8,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "firefly/core/logging.h"
 #include "firefly/execution/engine.h"
 #include "firefly/execution/result_queue.h"
 #include "firefly/service/session.h"
@@ -19,18 +19,21 @@ namespace firefly::service
 {
 namespace
 {
-std::vector<int> parse_prompt(const std::string& body, const model::Tokenizer& tokenizer, int& max_tokens)
+std::vector<int> parse_prompt(const std::string& body, const model::Tokenizer& tokenizer, int& max_tokens,
+                              bool& ignore_eos)
 {
     using json = nlohmann::json;
     std::vector<int> input_ids;
     int im_start_id = tokenizer.token_id("<|im_start|>");
     int im_end_id = tokenizer.token_id("<|im_end|>");
     max_tokens = 512;
+    ignore_eos = false;
 
     if (!body.empty())
     {
         auto request = json::parse(body);
         if (request.contains("max_tokens")) max_tokens = request["max_tokens"].get<int>();
+        ignore_eos = request.value("ignore_eos", false);
 
         auto append_message = [&](const std::string& role, const std::string& content)
         {
@@ -126,14 +129,15 @@ private:
         try
         {
             int max_tokens = 0;
-            auto input_ids = parse_prompt(body, tokenizer_, max_tokens);
+            bool ignore_eos = false;
+            auto input_ids = parse_prompt(body, tokenizer_, max_tokens, ignore_eos);
             auto request_id = "req-" + std::to_string(next_request_id_.fetch_add(1));
             {
                 std::lock_guard<std::mutex> lock(sessions_mutex_);
                 sessions_[request_id] = session;
             }
-            std::cout << "[Server] Request chat completions limit: " << max_tokens << std::endl;
-            engine_.async_generate(request_id, input_ids, max_tokens, session->cancel_flag);
+            FIREFLY_LOG_DEBUG("service", "chat completion accepted max_tokens={}", max_tokens);
+            engine_.async_generate(request_id, input_ids, max_tokens, session->cancel_flag, ignore_eos);
         }
         catch (const std::exception& error)
         {

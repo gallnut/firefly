@@ -7,6 +7,7 @@ lib/
 .vscode/
 
 qwen3/
+qwen35/
 
 **/__pycache__/
 **/.venv/

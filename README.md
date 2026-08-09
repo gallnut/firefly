@@ -90,7 +90,15 @@ Run the firefly_server executable, pointing it to the directory containing your 
 ./build/bin/firefly_server /path/to/qwen3/model_dir
 ```
 
-Optional argument: --max-prefill-chunk-size <size> to configure the prefill chunking limit.
+Runtime options:
+
+- `--max-prefill-chunk-size <size>` configures the prefill chunking limit.
+- `--log-level <trace|debug|info|warn|error|critical>` configures the minimum log level.
+- `--log-color <auto|always|never>` controls ANSI colors. `auto` is the default and disables colors when redirected.
+- `--log-detail` includes the thread ID, source location, and function name.
+
+The same logging settings can be provided through `FIREFLY_LOG_LEVEL`, `FIREFLY_LOG_COLOR`, and
+`FIREFLY_LOG_DETAIL`. Setting `NO_COLOR` also disables colors when automatic color detection is used.
 
 2.Client Examples
 
