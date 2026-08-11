@@ -8,48 +8,80 @@
 
 Firefly is a lightweight, high-performance Large Language Model (LLM) inference framework built entirely from scratch using modern C++23 and CUDA. 
 
-Designed without the overhead of heavy deep learning frameworks, Firefly strips away the bloat to focus on what matters: raw performance, elegant memory management, and highly optimized custom kernels. Currently, Firefly is tailored for the Qwen architecture (Qwen2/Qwen3) and provides a robust gRPC serving interface.
+Designed without the overhead of heavy deep learning frameworks, Firefly strips away the bloat to focus on what matters: raw performance, elegant memory management, and highly optimized custom kernels. Currently, Firefly is tailored for the Qwen architecture (Qwen2/Qwen3/Qwen3.5) and provides a robust gRPC serving interface.
 
-## ✨ Why Firefly?
+## ✨ Motivation
 
-Unlike traditional frameworks, Firefly is built for developers who want to understand and control every byte of memory and every CUDA cycle. 
+Firefly is a learning-driven project. Instead of cloning a production framework, it reimplements the whole LLM inference
+pipeline from scratch (weight loading, KV cache, scheduling, CUDA kernels) to understand the engineering trade-offs
+behind mature solutions like vLLM and FlashAttention.
 
-* **No Bloatware:** A pure C++/CUDA implementation. No PyTorch, no massive dependency trees.
-* **Modern C++23 Elegance:** Leverages cutting-edge C++ features like `std::expected` for monadic error handling and `std::mdspan` for multi-dimensional, zero-overhead tensor views.
-* **Hardware-Squeezing Performance:** Direct integration with **NVIDIA CUTLASS** and custom WMMA Tensor Core kernels to push your GPU to its limits.
+* Pure C++/CUDA implementation with no PyTorch dependency and a minimal dependency tree (CUTLASS, FlashInfer and gRPC
+  are managed through CPM).
+* Modern C++23 throughout (`std::expected`, `std::mdspan`).
 
-## 🧠 Architecture & Key Features
+## 🧠 Architecture
 
-### 1. Advanced Attention Mechanisms
-* **FlashAttention (Prefill):** Implemented using WMMA (Warp Matrix Multiply Accumulate) to maximize Tensor Core utilization during the compute-heavy prefill phase.
-* **PagedAttention (Decode):** A custom non-contiguous KV-cache memory manager that eliminates memory fragmentation and allows for highly efficient continuous batching.
+Firefly is organized by responsibility:
 
-### 2. Smart Memory Management
-* **Prefix Caching via Radix Tree:** Firefly implements a thread-safe Radix Tree (`src/radix_tree.cc`) to cache and share KV-blocks across requests that share common prompt prefixes, dramatically reducing TTFT (Time To First Token) for multi-turn chats or system prompts.
-* **Zero-Copy Weight Loading:** Uses memory-mapped files and CUDA pinned memory (`PinnedMappedFile`) to stream `.safetensors` weights directly to the GPU, bypassing unnecessary CPU RAM bottlenecks.
-* **Custom Memory Pooling:** Features a dedicated `ModelWeightPool` and `BlockAllocator` to avoid runtime `cudaMalloc` overheads.
+- **model layer** defines models and orchestrates forward passes (Qwen2/3/3.5). It contains no CUDA kernels.
+- **kernels layer** holds all operator implementations: attention (FlashInfer backend, hand-written WMMA tiled prefill,
+  paged decode fallback, quantized attention), linear attention (Gated Delta Net / causal convolution), transformer ops
+  (RMSNorm, RoPE, SwiGLU, ...), cache and sampling.
+- **execution / scheduler layer** implements continuous batching, chunked prefill, mixed prefill/decode scheduling and
+  CUDA Graph decode. The gRPC layer is decoupled from the engine through input/output queues.
+- **memory management** covers the paged KV cache and block allocator, prefix cache, model weight pool, and
+  mmap + pinned-memory safetensors loading.
 
-### 3. Continuous Batching & Graph Execution
-* **Iteration-Level Scheduling:** The scheduler evaluates the queue at every token generation step, dynamically admitting new requests to maximize throughput.
-* **CUDA Graphs:** The decode phase utilizes pre-captured CUDA Graphs (`cudaGraph_t`) to eliminate CPU launch overhead, ensuring microseconds-level latency per token.
+Key mechanisms:
 
-## 📂 Project Structure
+- **Mixed batching**: prefill and decode run in the same ragged forward, which lowers TTFT under staggered load;
+  decode-only steps execute through pre-captured CUDA Graphs.
+- **Batched ragged prefill**: following vLLM, a single FlashInfer batch prefill is planned and launched using per-row
+  `q_indptr` / `kv_indptr`.
+- **Paged KV cache + prefix cache**: block-level allocation avoids fragmentation and shared prompt prefixes reuse KV
+  blocks across turns.
+- **KV cache quantization**: custom Int8 quantization (per-token scale) with matching dequantization operators.
 
-```text
-firefly/
-├── include/firefly/
-│   ├── hal/         # Hardware Abstraction Layer (RAII wrappers for CUDA Streams, Events, Graphs, Memory)
-│   ├── mm/          # Memory Management (Allocators, Mapped Files, KV-Block Pools)
-│   ├── model/       # Model Definitions & Configurations (Qwen2/3)
-│   └── ...          # Core structures: Tensor, Engine, Scheduler, RadixTree
-├── src/
-│   ├── kernels/     # Pure CUDA kernels (Attention, RoPE, RMSNorm, SwiGLU, Sampling)
-│   ├── model/       # Forward pass implementations
-│   └── ...          # System logic implementations
-├── proto/           # gRPC definitions for ChatCompletion API
-├── benchmarks/      # Python benchmarking scripts (Throughput, TTFT, TPOT)
-└── example/         # Python gRPC client examples (Unary & Streaming)
-```
+## 📊 Current Status
+
+Supported models: Qwen2 / Qwen3 / Qwen3.5 (hybrid linear attention with Gated Delta Net).
+
+Correctness is checked against vLLM under identical configurations. Measured on RTX 4060 Laptop 8GB (Release build,
+FlashInfer backend, Qwen3-0.6B, BF16):
+
+- Single request (128-token input): TTFT ≈29 ms, TPOT ≈5.3 ms (decode through CUDA Graph).
+- 8 concurrent requests (128-token input): TPOT ≈6.0-6.3 ms, ≈33 req/s and ~1.0-1.2k output tokens/s.
+- Long input (2048 tokens) + 8 concurrent: TTFT ≈750 ms / TPOT ≈13 ms on Qwen3; Qwen3.5 TPOT ≈9 ms.
+
+vs vLLM 0.26 (same model files, same 768-token prefill granularity, same concurrency, 32 requests per cell):
+
+- Decode (TPOT) is competitive or faster — Qwen3.5 at 2048-in / c8 reaches 9.0 ms vs vLLM's 24.6 ms.
+- Short-input throughput is within ~5-15% of vLLM; long-input prefill (TTFT) and throughput still trail, mostly due
+  to chunked-prefill scheduling/kernel maturity.
+- Full 90-config matrix and methodology: `docs/benchmarks.md`; raw per-request JSONs stay local (gitignored).
+
+Int8 KV cache quantization tradeoff (Qwen3):
+
+- KV memory drops by ~48%; the native Int8 paged-decode attention is ~2× faster at batch=8 with 2K-4K context, but
+  slower than BF16 for short contexts / low batch due to quantize/dequantize overhead.
+- Attention output error is small (relative L2 ≈0.3%, cosine ≥0.99999); greedy decoding still amplifies it, so long
+  generations diverge even though first tokens usually match.
+
+Highlights:
+
+- Hand-written C++ safetensors parser with mmap + pinned memory + async DMA loading.
+- Hand-written attention kernels coexist with FlashInfer so the gap between both can be studied.
+- Linear-attention operators are extracted into the kernels layer for reuse by future models.
+- Clear layering: the model layer only orchestrates; operators live in the kernels layer.
+
+Known limitations (stated honestly):
+
+- Hand-written attention still trails FlashInfer in some cases; FlashInfer is the default production backend.
+- Quantization currently covers the KV cache (Int8) only; weight W4A16/AWQ is not implemented.
+- No tensor parallelism / distributed support; model support is focused on the Qwen family.
+- Qwen3.5's default fused Gated Delta Net prefill currently hangs on long (2048+) inputs; set
+  `FIREFLY_QWEN35_GDN_PREFILL_BACKEND=chunk64` as a workaround until the fused path is fixed.
 
 ## 🛠️ Getting Started
 Prerequisites
@@ -115,30 +147,22 @@ python test_grpc_stream.py
 
 Use the built-in benchmark tool to test the engine's throughput and latency.
 ```bash
-
-cd benchmarks
-python benchmark_serving.py -c 8 -n 50 --model qwen3 --max-tokens 256
+python benchmarks/benchmark_serving.py -n 50 -c 8 --synthetic \
+  --min-input-tokens 64 --max-input-tokens 256 \
+  --min-output-tokens 128 --max-output-tokens 256 --model qwen3
 ```
 
-## 🗺️ Roadmap
+For reproducible Firefly-vs-vLLM matrices (calibrated prompts, same prefill granularity, per-cell JSON results), use
+`benchmarks/run_perf_matrix.py` with `--firefly-server`, `--firefly-python`, `--vllm-bin`, `--model-dirs`, etc. pointing
+at your environments; the 2026-08-11 summary report is `docs/benchmarks.md`, and raw JSONs are written to
+`benchmarks/results/` (gitignored).
 
-    [x] Base C++23 / CUDA Abstractions
-
-    [x] Zero-copy Safetensors Loader
-
-    [x] Paged KV Cache & Block Allocator
-
-    [x] Radix Tree Prefix Caching
-
-    [x] Continuous Batching & Chunked Prefill
-
-    [x] Hand-tuned Custom CUDA Kernels (FlashAttention, RoPE, etc.)
-
-    [ ] Quantization: Implement W4A16 / AWQ kernels to fit 7B models in 8GB VRAM.
-
-    [ ] Distributed: Tensor Parallelism support via NCCL.
-
-    [ ] Architectures: Support Llama-3 and Mistral architectures.
+Calibrate the prompt files first (token counts match the target input lengths under the HF chat template):
+```bash
+python benchmarks/make_calibrated_prompts.py \
+  --model-dir /path/to/qwen3 --model qwen3 \
+  --output-dir benchmarks/results/prompts
+```
 
 ## 🤝 Contributing
 

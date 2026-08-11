@@ -47,4 +47,10 @@ if(FIREFLY_HAS_FLASHINFER)
         CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
     add_test(NAME qwen_flashinfer_row_test COMMAND qwen_flashinfer_row_test)
 
+    add_executable(quantized_kv_tradeoff_test quantized_kv_tradeoff_test.cu)
+    target_link_libraries(quantized_kv_tradeoff_test PRIVATE firefly_runtime)
+    set_target_properties(quantized_kv_tradeoff_test PROPERTIES
+        CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+    add_test(NAME quantized_kv_tradeoff_test COMMAND quantized_kv_tradeoff_test)
+
 endif()
