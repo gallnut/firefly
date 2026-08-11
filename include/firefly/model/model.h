@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include "firefly/model/forward_context.h"
 #include "firefly/core/tensor.h"
@@ -22,7 +23,17 @@ struct ModelConfig
     double rms_norm_eps;
     float  rope_theta;
 
-    virtual ~ModelConfig() = default;
+};
+
+struct ModelRuntimeRequirements
+{
+    int  kv_cache_layer_count = 0;
+    int  kv_cache_head_count = 0;
+    int  kv_cache_head_dim = 0;
+    int  prefill_chunk_limit = 0;
+    bool sequence_state = false;
+    bool prefix_cache = true;
+    bool cuda_graph = true;
 };
 
 class Model
@@ -31,6 +42,12 @@ public:
     virtual ~Model() = default;
 
     virtual void load_weights(std::unordered_map<std::string, Tensor>& weights) = 0;
+
+    [[nodiscard]] virtual bool accepts_weight(std::string_view) const { return true; }
+    [[nodiscard]] virtual bool retains_source_weight(std::string_view) const { return true; }
+    [[nodiscard]] virtual ModelRuntimeRequirements runtime_requirements() const = 0;
+    virtual void initialize_runtime(int, const device::Context&) {}
+    virtual void reset_runtime(const device::Context&) {}
 
     virtual Tensor forward(const ModelInput& input, const ForwardOptions& options = {}) = 0;
 };

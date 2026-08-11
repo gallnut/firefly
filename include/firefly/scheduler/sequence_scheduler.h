@@ -21,7 +21,8 @@ class SequenceScheduler
 {
 public:
     SequenceScheduler();
-    void init(int max_context_blocks, int max_batch_size_limit, int max_prefill_chunk_size);
+    void init(int max_context_blocks, int max_batch_size_limit, int max_prefill_chunk_size,
+              bool prefix_cache_enabled = true);
 
     void add_sequence(SequencePtr sequence);
 
@@ -39,6 +40,8 @@ public:
     void abort_sequence(SequencePtr sequence);
 
     bool has_unfinished_sequences();
+    bool has_pending_sequences();
+    bool has_active_decode_sequences();
 
 private:
     std::mutex            mutex_;
@@ -50,8 +53,10 @@ private:
     int                        block_size_ = 16;
     int                        max_batch_size_limit_ = 64;
     int                        max_prefill_chunk_size_ = 256;
+    std::vector<int>           free_state_slots_;
 
     void release_owned_blocks(SequencePtr sequence);
+    void release_state_slot(SequencePtr sequence);
 };
 
 }  // namespace firefly::scheduler

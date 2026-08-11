@@ -1,8 +1,8 @@
 #include "firefly/scheduler/prefix_cache.h"
 
 #include <algorithm>
-#include <iostream>
 
+#include "firefly/core/logging.h"
 #include "firefly/scheduler/block_allocator.h"
 
 namespace firefly::scheduler
@@ -256,6 +256,6 @@ int PrefixCache::evict(int num_blocks_needed)
     return freed_blocks;
 }
 
-void PrefixCache::print_stats() const { std::cout << "[PrefixCache] stats unavailable\n"; }
+void PrefixCache::print_stats() const { FIREFLY_LOG_DEBUG("scheduler", "prefix cache statistics unavailable"); }
 
 }  // namespace firefly::scheduler

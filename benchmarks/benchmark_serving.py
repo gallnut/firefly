@@ -328,7 +328,11 @@ def build_specs(
 
 
 def build_request(args: argparse.Namespace, spec: RequestSpec) -> Any:
-    request = firefly_pb2.ChatCompletionRequest(model=args.model, max_tokens=spec.max_tokens)
+    request = firefly_pb2.ChatCompletionRequest(
+        model=args.model,
+        max_tokens=spec.max_tokens,
+        ignore_eos=args.ignore_eos,
+    )
     if args.system_prompt:
         msg = request.messages.add()
         msg.role = "system"
@@ -418,7 +422,7 @@ def build_openai_payload(args: argparse.Namespace, spec: RequestSpec) -> dict[st
         "max_tokens": spec.max_tokens,
         "temperature": 0.0,
         "stream": args.stream,
-        "ignore_eos": True,
+        "ignore_eos": args.ignore_eos,
     }
     if args.stream:
         payload["stream_options"] = {"include_usage": True}
@@ -1020,6 +1024,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-output-tokens", type=int, help="Randomize max_tokens lower bound.")
     parser.add_argument("--max-output-tokens", type=int, help="Randomize max_tokens upper bound.")
     parser.add_argument("--stream", action=argparse.BooleanOptionalAction, default=True, help="Use streaming RPC.")
+    parser.add_argument(
+        "--ignore-eos",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Continue generation until max_tokens even after an end token.",
+    )
     parser.add_argument("--prompt", help="Use one explicit prompt. By default, a mixed built-in prompt set is used.")
     parser.add_argument("--prompts-file", "--dataset", dest="prompts_file", help="Prompt dataset: jsonl/json/txt.")
     parser.add_argument("--max-samples", type=int, default=0, help="Limit samples loaded from prompt dataset. 0 means no limit.")

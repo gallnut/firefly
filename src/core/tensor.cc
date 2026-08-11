@@ -240,6 +240,21 @@ Tensor Tensor::from_external(void* data_ptr, std::vector<int64_t> shape, DType d
     return t;
 }
 
+Tensor Tensor::from_external(void* data_ptr, std::vector<int64_t> shape, std::vector<int64_t> strides, DType dtype,
+                             Device device)
+{
+    if (shape.size() != strides.size()) throw std::runtime_error("Tensor view shape and stride rank mismatch");
+    Tensor tensor;
+    tensor.data_ptr_ = data_ptr;
+    tensor.shape_ = std::move(shape);
+    tensor.strides_ = std::move(strides);
+    tensor.dtype_ = dtype;
+    tensor.device_ = device;
+    tensor.is_view_ = true;
+    tensor.numel_ = std::accumulate(tensor.shape_.begin(), tensor.shape_.end(), int64_t{1}, std::multiplies<>());
+    return tensor;
+}
+
 Tensor Tensor::clone() const
 {
     Tensor new_tensor(shape_, dtype_, device_, allocation_context_);

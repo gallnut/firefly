@@ -5,12 +5,12 @@
 #include <string>
 #include <unordered_map>
 
-#include "firefly/model/model.h"
+#include "firefly/model/config_loader.h"
 
 namespace firefly::model
 {
 
-using ModelFactory = std::function<std::unique_ptr<Model>(const ModelConfig&)>;
+using ModelFactory = std::function<std::unique_ptr<Model>(const ModelDescriptor&)>;
 
 class ModelRegistry
 {
@@ -19,7 +19,7 @@ public:
 
     void register_factory(const std::string& architecture_name, ModelFactory factory);
 
-    std::unique_ptr<Model> create(const std::string& architecture_name, const ModelConfig& config) const;
+    std::unique_ptr<Model> create(const ModelDescriptor& descriptor) const;
 
 private:
     ModelRegistry();

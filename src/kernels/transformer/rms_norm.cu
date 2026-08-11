@@ -1,9 +1,9 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include <iostream>
 #include <stdexcept>
 
+#include "firefly/core/logging.h"
 #include "firefly/kernels/detail/cuda_scalar.cuh"
 #include "firefly/kernels/transformer/rms_norm.h"
 
@@ -305,7 +305,8 @@ void rms_norm(const Tensor& input, const Tensor& weight, Tensor& output, double 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess)
     {
-        std::cerr << "CUDA Error in rms_norm: " << cudaGetErrorString(err) << std::endl;
+        FIREFLY_LOG_ERROR("cuda", "kernel launch failed operation=rms_norm error={} code={}",
+                          cudaGetErrorString(err), static_cast<int>(err));
     }
 }
 
@@ -366,7 +367,95 @@ void add_rms_norm(Tensor& residual, const Tensor& input, const Tensor& weight, T
                                     context.stream());
 
     cudaError_t error = cudaGetLastError();
-    if (error != cudaSuccess) std::cerr << "CUDA Error in add_rms_norm: " << cudaGetErrorString(error) << std::endl;
+    if (error != cudaSuccess)
+    {
+        FIREFLY_LOG_ERROR("cuda", "kernel launch failed operation=add_rms_norm error={} code={}",
+                          cudaGetErrorString(error), static_cast<int>(error));
+    }
+}
+
+template <typename scalar_t, bool AddResidual>
+__global__ void zero_centered_rms_norm_kernel(scalar_t* residual, const scalar_t* input, const scalar_t* weight,
+                                              scalar_t* output, int row_size, float epsilon)
+{
+    constexpr int threads = 128;
+    const int row = blockIdx.x;
+    scalar_t* residual_row = residual + static_cast<int64_t>(row) * row_size;
+    const scalar_t* input_row = input + static_cast<int64_t>(row) * row_size;
+    scalar_t* output_row = output + static_cast<int64_t>(row) * row_size;
+
+    float square_sum = 0.0f;
+    for (int index = threadIdx.x; index < row_size; index += blockDim.x)
+    {
+        float value = CudaScalar<scalar_t>::to_float(input_row[index]);
+        if constexpr (AddResidual)
+        {
+            value += CudaScalar<scalar_t>::to_float(residual_row[index]);
+            scalar_t rounded = CudaScalar<scalar_t>::from_float(value);
+            residual_row[index] = rounded;
+            value = CudaScalar<scalar_t>::to_float(rounded);
+        }
+        square_sum += value * value;
+    }
+    const float inverse_rms =
+        rsqrtf(block_reduce_sum<float, threads>(square_sum) / static_cast<float>(row_size) + epsilon);
+    for (int index = threadIdx.x; index < row_size; index += blockDim.x)
+    {
+        const float value =
+            CudaScalar<scalar_t>::to_float(AddResidual ? residual_row[index] : input_row[index]);
+        const float scale = 1.0f + CudaScalar<scalar_t>::to_float(weight[index]);
+        output_row[index] = CudaScalar<scalar_t>::from_float(value * inverse_rms * scale);
+    }
+}
+
+template <typename scalar_t, bool AddResidual>
+void dispatch_zero_centered_rms_norm(Tensor& residual, const Tensor& input, const Tensor& weight, Tensor& output,
+                                     int row_size, int rows, double epsilon, cudaStream_t stream)
+{
+    zero_centered_rms_norm_kernel<scalar_t, AddResidual><<<rows, 128, 0, stream>>>(
+        static_cast<scalar_t*>(residual.data()), static_cast<const scalar_t*>(input.data()),
+        static_cast<const scalar_t*>(weight.data()), static_cast<scalar_t*>(output.data()), row_size,
+        static_cast<float>(epsilon));
+}
+
+void rms_norm_zero_centered(const Tensor& input, const Tensor& weight, Tensor& output, double epsilon,
+                            const device::Context& context)
+{
+    require_float16_or_bfloat16(input.dtype(), "rms_norm_zero_centered");
+    require_same_dtype(input.dtype(), weight.dtype(), "rms_norm_zero_centered");
+    require_same_dtype(input.dtype(), output.dtype(), "rms_norm_zero_centered");
+    const int row_size = input.shape().back();
+    const int rows = input.numel() / row_size;
+    Tensor empty;
+    if (input.dtype() == DType::BF16)
+        dispatch_zero_centered_rms_norm<__nv_bfloat16, false>(empty, input, weight, output, row_size, rows, epsilon,
+                                                              context.stream());
+    else
+        dispatch_zero_centered_rms_norm<half, false>(empty, input, weight, output, row_size, rows, epsilon,
+                                                     context.stream());
+    const cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess)
+        throw std::runtime_error(std::string("rms_norm_zero_centered failed: ") + cudaGetErrorString(error));
+}
+
+void add_rms_norm_zero_centered(Tensor& residual, const Tensor& input, const Tensor& weight, Tensor& output,
+                                double epsilon, const device::Context& context)
+{
+    require_float16_or_bfloat16(residual.dtype(), "add_rms_norm_zero_centered");
+    require_same_dtype(residual.dtype(), input.dtype(), "add_rms_norm_zero_centered");
+    require_same_dtype(residual.dtype(), weight.dtype(), "add_rms_norm_zero_centered");
+    require_same_dtype(residual.dtype(), output.dtype(), "add_rms_norm_zero_centered");
+    const int row_size = residual.shape().back();
+    const int rows = residual.numel() / row_size;
+    if (residual.dtype() == DType::BF16)
+        dispatch_zero_centered_rms_norm<__nv_bfloat16, true>(residual, input, weight, output, row_size, rows,
+                                                             epsilon, context.stream());
+    else
+        dispatch_zero_centered_rms_norm<half, true>(residual, input, weight, output, row_size, rows, epsilon,
+                                                    context.stream());
+    const cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess)
+        throw std::runtime_error(std::string("add_rms_norm_zero_centered failed: ") + cudaGetErrorString(error));
 }
 
 }  // namespace firefly::kernels

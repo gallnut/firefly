@@ -2,8 +2,8 @@
 #include <cuda_runtime.h>
 
 #include <cub/block/block_reduce.cuh>
-#include <iostream>
 
+#include "firefly/core/logging.h"
 #include "firefly/kernels/detail/cuda_scalar.cuh"
 #include "firefly/kernels/sampling/argmax.h"
 
@@ -70,7 +70,8 @@ void argmax(const Tensor& logits, Tensor& output_token, const device::Context& c
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess)
     {
-        std::cerr << "CUDA Error in argmax: " << cudaGetErrorString(err) << std::endl;
+        FIREFLY_LOG_ERROR("cuda", "kernel launch failed operation=argmax error={} code={}",
+                          cudaGetErrorString(err), static_cast<int>(err));
     }
 }
 

@@ -2,6 +2,8 @@
 
 #include <algorithm>
 
+#include "firefly/core/logging.h"
+
 namespace firefly::execution
 {
 
@@ -12,11 +14,18 @@ void Engine::process_outputs(const std::vector<scheduler::SequencePtr>& sequence
         if (request->generated_tokens.empty()) continue;
 
         int next_token_id = request->generated_tokens.back();
+        FIREFLY_LOG_TRACE("generation", "request_id={} token_index={} token_id={}", request->id,
+                          request->generated_tokens.size() - 1, next_token_id);
         std::string text = tokenizer_.decode(next_token_id);
-        bool hit_stop_token =
+        bool hit_stop_token = !request->ignore_eos &&
             (tokenizer_.has_token("<|im_end|>") && next_token_id == tokenizer_.token_id("<|im_end|>")) ||
-            (tokenizer_.has_token("<|endoftext|>") && next_token_id == tokenizer_.token_id("<|endoftext|>"));
+            (!request->ignore_eos && tokenizer_.has_token("<|endoftext|>") &&
+             next_token_id == tokenizer_.token_id("<|endoftext|>"));
         bool is_finished = hit_stop_token || request->generated_tokens.size() >= static_cast<size_t>(request->max_tokens);
+
+        FIREFLY_LOG_DEBUG("generation", "request_id={} token_index={} token_id={} finished={} stop_token={}",
+                          request->id, request->generated_tokens.size() - 1, next_token_id, is_finished,
+                          hit_stop_token);
 
         request->utf8_buffer += text;
         size_t valid_length = 0;

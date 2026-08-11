@@ -2,13 +2,14 @@
 
 #include <cuda_runtime.h>
 
-#include <cstdio>
 #include <cstdlib>
 #include <optional>
 #include <source_location>
 #include <string>
 #include <string_view>
 #include <variant>
+
+#include "firefly/core/logging.h"
 
 #if __has_include(<expected>) && __cplusplus > 202002L
 #include <expected>
@@ -216,8 +217,10 @@ inline void check_cuda_fatal(cudaError_t err, std::source_location loc = std::so
 {
     if (__builtin_expect(err != cudaSuccess, 0))
     {
-        fprintf(stderr, "Fatal CUDA Error at %s:%d: %s (%s)\n", loc.file_name(), loc.line(), cudaGetErrorString(err),
-                cudaGetErrorName(err));
+        log::submit_sync(log::Level::Critical, "cuda",
+                         std::format("fatal CUDA error error={} name={}", cudaGetErrorString(err),
+                                     cudaGetErrorName(err)),
+                         loc);
         std::abort();
     }
 }

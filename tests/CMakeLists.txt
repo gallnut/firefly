@@ -27,10 +27,30 @@ set_target_properties(device_context_stream_test PROPERTIES
 )
 add_test(NAME device_context_stream_test COMMAND device_context_stream_test)
 
+add_executable(qwen35_gated_delta_net_accuracy_test qwen35_gated_delta_net_accuracy_test.cu)
+target_link_libraries(qwen35_gated_delta_net_accuracy_test PRIVATE firefly_runtime)
+set_target_properties(qwen35_gated_delta_net_accuracy_test PROPERTIES
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+)
+add_test(NAME qwen35_gated_delta_net_accuracy_test COMMAND qwen35_gated_delta_net_accuracy_test)
+
 if(FIREFLY_HAS_FLASHINFER)
     add_executable(attention_flashinfer_accuracy_test attention_flashinfer_accuracy_test.cu)
     target_link_libraries(attention_flashinfer_accuracy_test PRIVATE firefly_runtime)
     set_target_properties(attention_flashinfer_accuracy_test PROPERTIES
         CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
     add_test(NAME attention_flashinfer_accuracy_test COMMAND attention_flashinfer_accuracy_test)
+
+    add_executable(qwen_flashinfer_row_test qwen_flashinfer_row_test.cu)
+    target_link_libraries(qwen_flashinfer_row_test PRIVATE firefly_runtime)
+    set_target_properties(qwen_flashinfer_row_test PROPERTIES
+        CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+    add_test(NAME qwen_flashinfer_row_test COMMAND qwen_flashinfer_row_test)
+
+    add_executable(quantized_kv_tradeoff_test quantized_kv_tradeoff_test.cu)
+    target_link_libraries(quantized_kv_tradeoff_test PRIVATE firefly_runtime)
+    set_target_properties(quantized_kv_tradeoff_test PROPERTIES
+        CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+    add_test(NAME quantized_kv_tradeoff_test COMMAND quantized_kv_tradeoff_test)
+
 endif()

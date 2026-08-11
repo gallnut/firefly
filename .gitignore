@@ -7,9 +7,12 @@ lib/
 .vscode/
 
 qwen3/
+qwen35/
 
 **/__pycache__/
 **/.venv/
 
 example/firefly_pb2_grpc.py
 example/firefly_pb2.py
+
+benchmarks/results/

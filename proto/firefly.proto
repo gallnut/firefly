@@ -17,6 +17,7 @@ message ChatCompletionRequest {
   int32 max_tokens = 2;
   repeated ChatMessage messages = 3;
   string prompt = 4;
+  bool ignore_eos = 5;
 }
 
 message MessageChoice {

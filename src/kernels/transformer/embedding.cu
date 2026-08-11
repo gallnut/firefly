@@ -1,8 +1,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include <iostream>
 
+#include "firefly/core/logging.h"
 #include "firefly/kernels/transformer/embedding.h"
 
 namespace firefly::kernels
@@ -62,8 +62,8 @@ void embedding_lookup(const Tensor& input_ids, const Tensor& embedding_table, Te
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess)
     {
-        std::cerr << "CUDA Error in embedding_lookup launch: " << cudaGetErrorString(err) << " (Code: " << err << ")"
-                  << std::endl;
+        FIREFLY_LOG_ERROR("cuda", "kernel launch failed operation=embedding_lookup error={} code={}",
+                          cudaGetErrorString(err), static_cast<int>(err));
     }
 }
 
