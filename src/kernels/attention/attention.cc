@@ -4,10 +4,10 @@
 
 #include <cmath>
 #include <cstdlib>
-#include <stdexcept>
 #include <string>
 
 #include "firefly/core/logging.h"
+#include "firefly/device/error.h"
 #include "firefly/kernels/attention/detail/flashinfer.h"
 #include "firefly/kernels/attention/detail/launch.h"
 
@@ -44,68 +44,79 @@ attention_detail::DecodeConfig decode_config()
     return config;
 }
 
-void check_launch(const char* operation)
+Status check_launch(const char* operation)
 {
     cudaError_t error = cudaGetLastError();
-    if (error != cudaSuccess)
-    {
-        throw std::runtime_error(std::string(operation) + " failed: " + cudaGetErrorString(error));
-    }
+    if (error != cudaSuccess) return unexpected(device::cuda_error(error, operation));
+    return {};
 }
 
-void validate_common(const Tensor& query, const Tensor& output, const AttentionOptions& options)
+Status validate_common(const Tensor& query, const Tensor& output, const AttentionOptions& options)
 {
-    require_float16_or_bfloat16(query.dtype(), "attention");
-    require_same_dtype(query.dtype(), output.dtype(), "attention");
-    if (query.shape().size() != 4) throw std::runtime_error("attention expects rank-4 query tensor");
-    if (query.shape()[1] <= 0) throw std::runtime_error("attention requires a non-empty sequence");
+    FIREFLY_TRY(require_float16_or_bfloat16(query.dtype(), "attention"));
+    FIREFLY_TRY(require_same_dtype(query.dtype(), output.dtype(), "attention"));
+    if (query.shape().size() != 4)
+        return unexpected(Error{ErrorCode::InvalidArgument, "attention expects rank-4 query tensor"});
+    if (query.shape()[1] <= 0)
+        return unexpected(Error{ErrorCode::InvalidArgument, "attention requires a non-empty sequence"});
     if (options.kv_head_count <= 0 || query.shape()[2] % options.kv_head_count != 0)
     {
-        throw std::runtime_error("attention requires query heads to be divisible by KV heads");
+        return unexpected(Error{ErrorCode::InvalidArgument,
+                                "attention requires query heads to be divisible by KV heads"});
     }
     if (output.numel() != query.numel())
     {
-        throw std::runtime_error("attention output element count does not match query shape");
+        return unexpected(Error{ErrorCode::InvalidArgument,
+                                "attention output element count does not match query shape"});
     }
+    return {};
 }
 
-void validate_contiguous(const Tensor& query, const Tensor& key, const Tensor& value, const AttentionOptions& options)
+Status validate_contiguous(const Tensor& query, const Tensor& key, const Tensor& value,
+                           const AttentionOptions& options)
 {
-    require_same_dtype(query.dtype(), key.dtype(), "attention");
-    require_same_dtype(query.dtype(), value.dtype(), "attention");
+    FIREFLY_TRY(require_same_dtype(query.dtype(), key.dtype(), "attention"));
+    FIREFLY_TRY(require_same_dtype(query.dtype(), value.dtype(), "attention"));
     const auto& shape = query.shape();
     if (key.shape().size() != 4 || value.shape().size() != 4 || key.shape()[0] != shape[0] ||
-        value.shape()[0] != shape[0] || key.shape()[1] != shape[1] || value.shape()[1] != shape[1] ||
+        value.shape()[0] != shape[0] || (options.causal && key.shape()[1] != shape[1]) ||
+        value.shape()[1] != key.shape()[1] ||
         key.shape()[2] != options.kv_head_count || value.shape()[2] != options.kv_head_count ||
         key.shape()[3] != shape[3] || value.shape()[3] != shape[3])
     {
-        throw std::runtime_error("contiguous attention expects KV shape [batch, sequence, KV heads, head dim]");
+        return unexpected(Error{ErrorCode::InvalidArgument,
+                                "contiguous attention expects KV shape [batch, sequence, KV heads, head dim]"});
     }
+    return {};
 }
 
-void validate_paged(const Tensor& query, const Tensor& key, const Tensor& value, const AttentionOptions& options)
+Status validate_paged(const Tensor& query, const Tensor& key, const Tensor& value, const AttentionOptions& options)
 {
     if (options.block_table == nullptr || options.context_lengths == nullptr)
     {
-        throw std::runtime_error("paged attention requires a block table and context lengths");
+        return unexpected(Error{ErrorCode::InvalidArgument,
+                                "paged attention requires a block table and context lengths"});
     }
     const int head_dim = query.shape()[3];
     if (key.shape().size() != 4 || value.shape().size() != 4 || key.shape()[1] != 16 || value.shape()[1] != 16 ||
         key.shape()[2] != options.kv_head_count || value.shape()[2] != options.kv_head_count ||
         key.shape()[3] != head_dim || value.shape()[3] != head_dim)
     {
-        throw std::runtime_error("paged attention expects KV cache shape [blocks, 16, KV heads, head dim]");
+        return unexpected(Error{ErrorCode::InvalidArgument,
+                                "paged attention expects KV cache shape [blocks, 16, KV heads, head dim]"});
     }
 
     if (options.kv_scales == nullptr)
     {
-        require_same_dtype(query.dtype(), key.dtype(), "attention");
-        require_same_dtype(query.dtype(), value.dtype(), "attention");
+        FIREFLY_TRY(require_same_dtype(query.dtype(), key.dtype(), "attention"));
+        FIREFLY_TRY(require_same_dtype(query.dtype(), value.dtype(), "attention"));
     }
     else if (key.dtype() != DType::I8 || value.dtype() != DType::I8 || options.kv_scales->dtype() != DType::F32)
     {
-        throw std::runtime_error("quantized KV attention requires I8 caches and F32 scales");
+        return unexpected(Error{ErrorCode::InvalidArgument,
+                                "quantized KV attention requires I8 caches and F32 scales"});
     }
+    return {};
 }
 }  // namespace
 
@@ -148,22 +159,22 @@ AttentionBackend get_attention_backend()
     return backend;
 }
 
-void reserve_paged_decode_scratch(int batch_size, int num_heads, int max_context_blocks, int head_dim)
+Status reserve_paged_decode_scratch(int batch_size, int num_heads, int max_context_blocks, int head_dim)
 {
-    attention_detail::reserve_decode_scratch(batch_size, num_heads, max_context_blocks, head_dim,
-                                             decode_config().split_size);
+    return attention_detail::reserve_decode_scratch(batch_size, num_heads, max_context_blocks, head_dim,
+                                                    decode_config().split_size);
 }
 
-void prepare_attention_prefill(const int* block_table, int batch_size, int sequence_length, int context_length,
-                               int max_context_blocks, int num_query_heads, int num_kv_heads, int head_dim,
-                               const device::Context& context)
+Status prepare_attention_prefill(const int* block_table, int batch_size, int sequence_length, int context_length,
+                                 int max_context_blocks, int num_query_heads, int num_kv_heads, int head_dim,
+                                 const device::Context& context)
 {
 #ifdef FIREFLY_USE_FLASHINFER
     if (get_attention_backend() == AttentionBackend::FlashInfer)
     {
-        attention_backend::prepare_flashinfer_prefill(block_table, batch_size, sequence_length, context_length,
-                                                      max_context_blocks, num_query_heads, num_kv_heads, head_dim,
-                                                      context.stream());
+        return attention_backend::prepare_flashinfer_prefill(block_table, batch_size, sequence_length,
+                                                             context_length, max_context_blocks, num_query_heads,
+                                                             num_kv_heads, head_dim, context.stream());
     }
 #else
     (void)block_table;
@@ -176,19 +187,20 @@ void prepare_attention_prefill(const int* block_table, int batch_size, int seque
     (void)head_dim;
     (void)context;
 #endif
+    return {};
 }
 
-bool prepare_attention_prefill_ragged(const std::vector<int>& q_indptr, const std::vector<int>& kv_indptr,
-                                      const std::vector<int>& last_page_len, int max_context_blocks,
-                                      int num_query_heads, int num_kv_heads, int head_dim,
-                                      const device::Context& context)
+Result<bool> prepare_attention_prefill_ragged(const std::vector<int>& q_indptr, const std::vector<int>& kv_indptr,
+                                              const std::vector<int>& last_page_len, int max_context_blocks,
+                                              int num_query_heads, int num_kv_heads, int head_dim,
+                                              const device::Context& context)
 {
 #ifdef FIREFLY_USE_FLASHINFER
     if (get_attention_backend() == AttentionBackend::FlashInfer)
     {
-        attention_backend::prepare_flashinfer_prefill_ragged(q_indptr, kv_indptr, last_page_len, max_context_blocks,
-                                                             num_query_heads, num_kv_heads, head_dim,
-                                                             context.stream());
+        FIREFLY_TRY(attention_backend::prepare_flashinfer_prefill_ragged(
+            q_indptr, kv_indptr, last_page_len, max_context_blocks, num_query_heads, num_kv_heads, head_dim,
+            context.stream()));
         return true;
     }
 #else
@@ -204,9 +216,9 @@ bool prepare_attention_prefill_ragged(const std::vector<int>& q_indptr, const st
     return false;
 }
 
-bool launch_attention_prefill_ragged(Tensor& query, Tensor& key_cache, Tensor& value_cache, Tensor& output,
-                                     const int* block_table, int kv_head_count, int max_context_blocks, float scale,
-                                     const device::Context& context)
+Result<bool> launch_attention_prefill_ragged(Tensor& query, Tensor& key_cache, Tensor& value_cache, Tensor& output,
+                                             const int* block_table, int kv_head_count, int max_context_blocks,
+                                             float scale, const device::Context& context)
 {
 #ifdef FIREFLY_USE_FLASHINFER
     if (get_attention_backend() == AttentionBackend::FlashInfer)
@@ -228,10 +240,10 @@ bool launch_attention_prefill_ragged(Tensor& query, Tensor& key_cache, Tensor& v
     return false;
 }
 
-void attention(Tensor& query, Tensor& key, Tensor& value, Tensor& output, const AttentionOptions& options,
-               const device::Context& context)
+Status attention(Tensor& query, Tensor& key, Tensor& value, Tensor& output, const AttentionOptions& options,
+                 const device::Context& context)
 {
-    validate_common(query, output, options);
+    FIREFLY_TRY(validate_common(query, output, options));
     AttentionBackend backend = options.backend;
     bool             requested_flashinfer = backend == AttentionBackend::FlashInfer;
     if (backend == AttentionBackend::Auto)
@@ -249,30 +261,31 @@ void attention(Tensor& query, Tensor& key, Tensor& value, Tensor& output, const 
 
     if (backend == AttentionBackend::FlashInfer)
     {
+        if (!options.causal) backend = AttentionBackend::Contiguous;
         bool launched = false;
-        if (options.block_table == nullptr && sequence_length > 1)
+        if (backend == AttentionBackend::FlashInfer && options.block_table == nullptr && sequence_length > 1)
         {
-            validate_contiguous(query, key, value, options);
-            launched = attention_backend::launch_flashinfer_contiguous_prefill(query, key, value, output,
-                                                                               options.kv_head_count, scale, context);
+            FIREFLY_TRY(validate_contiguous(query, key, value, options));
+            launched = FIREFLY_TRY(attention_backend::launch_flashinfer_contiguous_prefill(
+                query, key, value, output, options.kv_head_count, scale, context));
         }
         else if (options.block_table != nullptr && sequence_length == 1)
         {
-            validate_paged(query, key, value, options);
-            launched = attention_backend::launch_flashinfer_decode(query, key, value, output, options.kv_head_count,
-                                                                   head_dim, scale, context);
+            FIREFLY_TRY(validate_paged(query, key, value, options));
+            launched = FIREFLY_TRY(attention_backend::launch_flashinfer_decode(
+                query, key, value, output, options.kv_head_count, head_dim, scale, context));
         }
         else if (options.block_table != nullptr && options.prefill_context_length >= 0)
         {
-            validate_paged(query, key, value, options);
-            launched = attention_backend::launch_flashinfer_prefill(
+            FIREFLY_TRY(validate_paged(query, key, value, options));
+            launched = FIREFLY_TRY(attention_backend::launch_flashinfer_prefill(
                 query, key, value, output, options.block_table, options.kv_head_count, sequence_length,
-                options.max_context_blocks, options.prefill_context_length, scale, context);
+                options.max_context_blocks, options.prefill_context_length, scale, context));
         }
         if (launched)
         {
-            check_launch("FlashInfer attention launch");
-            return;
+            FIREFLY_TRY(check_launch("FlashInfer attention launch"));
+            return {};
         }
 
         static bool warned = false;
@@ -284,38 +297,42 @@ void attention(Tensor& query, Tensor& key, Tensor& value, Tensor& output, const 
         backend = options.block_table == nullptr ? AttentionBackend::Contiguous : AttentionBackend::Paged;
     }
 
+    bool launched_quantized = false;
     if (requested_flashinfer && options.kv_scales != nullptr && sequence_length > 1 &&
-        options.prefill_context_length >= 0 &&
-        attention_backend::launch_flashinfer_quantized_prefill(
+        options.prefill_context_length >= 0)
+        launched_quantized = FIREFLY_TRY(attention_backend::launch_flashinfer_quantized_prefill(
             query, key, value, const_cast<Tensor&>(*options.kv_scales), options.block_table, output,
-            options.kv_head_count, options.max_context_blocks, options.prefill_context_length, scale, context))
+            options.kv_head_count, options.max_context_blocks, options.prefill_context_length, scale, context));
+    if (launched_quantized)
     {
-        check_launch("FlashInfer quantized prefill launch");
-        return;
+        FIREFLY_TRY(check_launch("FlashInfer quantized prefill launch"));
+        return {};
     }
 
     if (backend == AttentionBackend::Contiguous)
     {
-        validate_contiguous(query, key, value, options);
-        attention_detail::launch_contiguous(query, key, value, output, options, scale, context);
+        FIREFLY_TRY(validate_contiguous(query, key, value, options));
+        FIREFLY_TRY(attention_detail::launch_contiguous(query, key, value, output, options, scale, context));
     }
     else if (backend == AttentionBackend::Paged)
     {
-        validate_paged(query, key, value, options);
+        FIREFLY_TRY(validate_paged(query, key, value, options));
         if (options.kv_scales != nullptr)
         {
-            attention_detail::launch_quantized_paged(query, key, value, output, options, decode_config(), scale,
-                                                     context);
+            FIREFLY_TRY(attention_detail::launch_quantized_paged(query, key, value, output, options,
+                                                                 decode_config(), scale, context));
         }
         else
         {
-            attention_detail::launch_paged(query, key, value, output, options, decode_config(), scale, context);
+            FIREFLY_TRY(attention_detail::launch_paged(query, key, value, output, options, decode_config(), scale,
+                                                       context));
         }
     }
     else
     {
-        throw std::runtime_error("unsupported attention backend");
+        return unexpected(Error{ErrorCode::InvalidArgument, "unsupported attention backend"});
     }
-    check_launch("attention launch");
+    FIREFLY_TRY(check_launch("attention launch"));
+    return {};
 }
 }  // namespace firefly::kernels

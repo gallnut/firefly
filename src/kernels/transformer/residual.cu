@@ -3,6 +3,7 @@
 
 
 #include "firefly/core/logging.h"
+#include "firefly/device/error.h"
 #include "firefly/kernels/detail/cuda_scalar.cuh"
 #include "firefly/kernels/transformer/residual.h"
 
@@ -80,10 +81,12 @@ void dispatch_add_inplace(Tensor& x, const Tensor& y, int64_t numel, cudaStream_
     }
 }
 
-void add_inplace(Tensor& x, const Tensor& y, const device::Context& context)
+Status add_inplace(Tensor& x, const Tensor& y, const device::Context& context)
 {
-    require_float16_or_bfloat16(x.dtype(), "add_inplace");
-    require_same_dtype(x.dtype(), y.dtype(), "add_inplace");
+    FIREFLY_TRY(require_float16_or_bfloat16(x.dtype(), "add_inplace"));
+    FIREFLY_TRY(require_same_dtype(x.dtype(), y.dtype(), "add_inplace"));
+    if (x.numel() != y.numel())
+        return unexpected(Error{ErrorCode::InvalidArgument, "add_inplace tensor sizes differ"});
 
     int64_t numel = x.numel();
 
@@ -97,11 +100,8 @@ void add_inplace(Tensor& x, const Tensor& y, const device::Context& context)
     }
 
     cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess)
-    {
-        FIREFLY_LOG_ERROR("cuda", "kernel launch failed operation=add_inplace error={} code={}",
-                          cudaGetErrorString(err), static_cast<int>(err));
-    }
+    if (err != cudaSuccess) return unexpected(device::cuda_error(err, "launch residual add kernel"));
+    return {};
 }
 
 }  // namespace firefly::kernels

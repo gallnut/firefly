@@ -3,6 +3,7 @@
 
 
 #include "firefly/core/logging.h"
+#include "firefly/device/error.h"
 #include "firefly/kernels/detail/cuda_scalar.cuh"
 #include "firefly/kernels/transformer/swiglu.h"
 
@@ -157,11 +158,13 @@ void dispatch_swiglu_fused(const Tensor& projected, Tensor& output, int row_widt
         element_count);
 }
 
-void swiglu(const Tensor& gate, const Tensor& up, Tensor& output, const device::Context& context)
+Status swiglu(const Tensor& gate, const Tensor& up, Tensor& output, const device::Context& context)
 {
-    require_float16_or_bfloat16(gate.dtype(), "swiglu");
-    require_same_dtype(gate.dtype(), up.dtype(), "swiglu");
-    require_same_dtype(gate.dtype(), output.dtype(), "swiglu");
+    FIREFLY_TRY(require_float16_or_bfloat16(gate.dtype(), "swiglu"));
+    FIREFLY_TRY(require_same_dtype(gate.dtype(), up.dtype(), "swiglu"));
+    FIREFLY_TRY(require_same_dtype(gate.dtype(), output.dtype(), "swiglu"));
+    if (gate.numel() != up.numel() || gate.numel() != output.numel())
+        return unexpected(Error{ErrorCode::InvalidArgument, "swiglu tensor sizes differ"});
 
     int64_t numel = output.numel();
 
@@ -175,21 +178,19 @@ void swiglu(const Tensor& gate, const Tensor& up, Tensor& output, const device::
     }
 
     cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess)
-    {
-        FIREFLY_LOG_ERROR("cuda", "kernel launch failed operation=swiglu error={} code={}",
-                          cudaGetErrorString(err), static_cast<int>(err));
-    }
+    if (err != cudaSuccess) return unexpected(device::cuda_error(err, "launch swiglu kernel"));
+    return {};
 }
 
-void swiglu_fused(const Tensor& projected, Tensor& output, const device::Context& context)
+Status swiglu_fused(const Tensor& projected, Tensor& output, const device::Context& context)
 {
-    require_float16_or_bfloat16(projected.dtype(), "swiglu_fused");
-    require_same_dtype(projected.dtype(), output.dtype(), "swiglu_fused");
+    FIREFLY_TRY(require_float16_or_bfloat16(projected.dtype(), "swiglu_fused"));
+    FIREFLY_TRY(require_same_dtype(projected.dtype(), output.dtype(), "swiglu_fused"));
     if (projected.shape().empty() || output.shape().empty() || projected.numel() != output.numel() * 2 ||
         projected.shape().back() != output.shape().back() * 2 || output.shape().back() % 8 != 0)
     {
-        throw std::runtime_error("swiglu_fused requires projected [..., 2 * width] and output [..., width]");
+        return unexpected(Error{ErrorCode::InvalidArgument,
+                                "swiglu_fused requires projected [..., 2 * width] and output [..., width]"});
     }
 
     const int row_width = output.shape().back();
@@ -199,9 +200,8 @@ void swiglu_fused(const Tensor& projected, Tensor& output, const device::Context
         dispatch_swiglu_fused<half>(projected, output, row_width, context.stream());
 
     const cudaError_t error = cudaGetLastError();
-    if (error != cudaSuccess)
-        FIREFLY_LOG_ERROR("cuda", "kernel launch failed operation=swiglu_fused error={} code={}",
-                          cudaGetErrorString(error), static_cast<int>(error));
+    if (error != cudaSuccess) return unexpected(device::cuda_error(error, "launch fused swiglu kernel"));
+    return {};
 }
 
 }  // namespace firefly::kernels

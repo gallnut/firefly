@@ -86,14 +86,15 @@ public:
     Logger() : worker_([this] { run(); }) {}
     ~Logger() { shutdown(); }
 
-    void configure(const Options& options)
+    bool configure(const Options& options)
     {
-        if (options.queue_capacity == 0) throw std::invalid_argument("log queue capacity must be positive");
+        if (options.queue_capacity == 0) return false;
         std::lock_guard lock(queue_mutex_);
         options_ = options;
         minimum_level_.store(options.level, std::memory_order_relaxed);
         detailed_.store(options.detailed, std::memory_order_relaxed);
         color_.store(options.color, std::memory_order_relaxed);
+        return true;
     }
 
     bool enabled(Level level) const noexcept
@@ -304,26 +305,31 @@ std::optional<ColorMode> parse_color_mode(std::string_view value) noexcept
     return std::nullopt;
 }
 
-Options options_from_environment()
+Result<Options> options_from_environment()
 {
     Options options;
     if (const char* value = std::getenv("FIREFLY_LOG_LEVEL"))
     {
         auto level = parse_level(value);
-        if (!level) throw std::invalid_argument("invalid FIREFLY_LOG_LEVEL");
+        if (!level) return unexpected(Error{ErrorCode::InvalidArgument, "invalid FIREFLY_LOG_LEVEL"});
         options.level = *level;
     }
     if (const char* value = std::getenv("FIREFLY_LOG_COLOR"))
     {
         auto color = parse_color_mode(value);
-        if (!color) throw std::invalid_argument("invalid FIREFLY_LOG_COLOR");
+        if (!color) return unexpected(Error{ErrorCode::InvalidArgument, "invalid FIREFLY_LOG_COLOR"});
         options.color = *color;
     }
     options.detailed = environment_flag("FIREFLY_LOG_DETAIL", false);
     return options;
 }
 
-void configure(const Options& options) { logger().configure(options); }
+Status configure(const Options& options)
+{
+    if (!logger().configure(options))
+        return unexpected(Error{ErrorCode::InvalidArgument, "log queue capacity must be positive"});
+    return {};
+}
 
 bool enabled(Level level) noexcept { return logger().enabled(level); }
 

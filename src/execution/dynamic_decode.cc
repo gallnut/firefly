@@ -4,11 +4,11 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
-#include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "firefly/core/logging.h"
+#include "firefly/device/error.h"
 #include "firefly/execution/engine.h"
 #include "firefly/kernels/attention/attention.h"
 #include "firefly/kernels/sampling/argmax.h"
@@ -77,39 +77,46 @@ DecodeHostScratch& decode_host_scratch()
 }
 }  // namespace
 
-void Engine::process_dynamic_decode(const std::vector<scheduler::SequencePtr>& requests, int max_context_length,
-                                    bool prefer_split_decode, const device::Context& context)
+Status Engine::process_dynamic_decode(const std::vector<scheduler::SequencePtr>& requests, int max_context_length,
+                                      bool prefer_split_decode, const device::Context& context)
 {
+    if (requests.empty()) return {};
     cudaStream_t decode_stream = context.stream();
     int          batch_size = requests.size();
 
-    auto ensure_storage = [this, &context](int required_batch_size, int block_table_elements)
+    auto ensure_storage = [this, &context](int required_batch_size, int block_table_elements) -> Status
     {
         if (decode_fb_input_capacity_ < required_batch_size)
         {
-            decode_fb_input_storage_ = Tensor({required_batch_size, 1}, DType::I32, Device::CUDA, context);
+            decode_fb_input_storage_ = FIREFLY_TRY(
+                Tensor::create({required_batch_size, 1}, DType::I32, Device::CUDA, context));
             decode_fb_input_capacity_ = required_batch_size;
         }
         if (decode_fb_context_capacity_ < required_batch_size)
         {
-            decode_fb_context_storage_ = Tensor({required_batch_size}, DType::I32, Device::CUDA, context);
+            decode_fb_context_storage_ = FIREFLY_TRY(
+                Tensor::create({required_batch_size}, DType::I32, Device::CUDA, context));
             decode_fb_context_capacity_ = required_batch_size;
         }
         if (decode_fb_next_token_capacity_ < required_batch_size)
         {
-            decode_fb_next_token_storage_ = Tensor({required_batch_size}, DType::I32, Device::CUDA, context);
+            decode_fb_next_token_storage_ = FIREFLY_TRY(
+                Tensor::create({required_batch_size}, DType::I32, Device::CUDA, context));
             decode_fb_next_token_capacity_ = required_batch_size;
         }
         if (decode_fb_state_slot_capacity_ < required_batch_size)
         {
-            decode_fb_state_slot_storage_ = Tensor({required_batch_size}, DType::I32, Device::CUDA, context);
+            decode_fb_state_slot_storage_ = FIREFLY_TRY(
+                Tensor::create({required_batch_size}, DType::I32, Device::CUDA, context));
             decode_fb_state_slot_capacity_ = required_batch_size;
         }
         if (decode_fb_block_table_capacity_ < block_table_elements)
         {
-            decode_fb_block_table_storage_ = Tensor({block_table_elements}, DType::I32, Device::CUDA, context);
+            decode_fb_block_table_storage_ = FIREFLY_TRY(
+                Tensor::create({block_table_elements}, DType::I32, Device::CUDA, context));
             decode_fb_block_table_capacity_ = block_table_elements;
         }
+        return {};
     };
 
 #ifdef FIREFLY_ENABLE_RUNTIME_PROFILING
@@ -153,7 +160,7 @@ void Engine::process_dynamic_decode(const std::vector<scheduler::SequencePtr>& r
     }
 
     int block_table_elems = batch_size * max_blocks;
-    ensure_storage(batch_size, block_table_elems);
+    FIREFLY_TRY(ensure_storage(batch_size, block_table_elems));
     Tensor d_input = Tensor::from_external(decode_fb_input_storage_.data(), {batch_size, 1}, DType::I32, Device::CUDA);
     Tensor d_context_lens =
         Tensor::from_external(decode_fb_context_storage_.data(), {batch_size}, DType::I32, Device::CUDA);
@@ -172,21 +179,25 @@ void Engine::process_dynamic_decode(const std::vector<scheduler::SequencePtr>& r
     }
 #endif
 
-    cudaMemcpyAsync(d_input.data(), scratch.input_ids.data(), scratch.input_ids.size() * sizeof(int),
-                    cudaMemcpyHostToDevice, decode_stream);
-    cudaMemcpyAsync(d_context_lens.data(), scratch.context_lens.data(), scratch.context_lens.size() * sizeof(int),
-                    cudaMemcpyHostToDevice, decode_stream);
-    cudaMemcpyAsync(d_state_slots.data(), scratch.state_slots.data(), scratch.state_slots.size() * sizeof(int),
-                    cudaMemcpyHostToDevice, decode_stream);
-    cudaMemcpyAsync(d_block_table_tensor.data(), scratch.block_table.data(), scratch.block_table.size() * sizeof(int),
-                    cudaMemcpyHostToDevice, decode_stream);
+    FIREFLY_TRY(device::check_cuda(cudaMemcpyAsync(d_input.data(), scratch.input_ids.data(),
+                                                   scratch.input_ids.size() * sizeof(int), cudaMemcpyHostToDevice,
+                                                   decode_stream), "copy decode token IDs"));
+    FIREFLY_TRY(device::check_cuda(cudaMemcpyAsync(d_context_lens.data(), scratch.context_lens.data(),
+                                                   scratch.context_lens.size() * sizeof(int), cudaMemcpyHostToDevice,
+                                                   decode_stream), "copy decode context lengths"));
+    FIREFLY_TRY(device::check_cuda(cudaMemcpyAsync(d_state_slots.data(), scratch.state_slots.data(),
+                                                   scratch.state_slots.size() * sizeof(int), cudaMemcpyHostToDevice,
+                                                   decode_stream), "copy decode state slots"));
+    FIREFLY_TRY(device::check_cuda(cudaMemcpyAsync(d_block_table_tensor.data(), scratch.block_table.data(),
+                                                   scratch.block_table.size() * sizeof(int), cudaMemcpyHostToDevice,
+                                                   decode_stream), "copy decode block table"));
     if (options_.kv_cache_format != KVCacheFormat::Int8 &&
         kernels::get_attention_backend() == kernels::AttentionBackend::FlashInfer)
     {
-        kernels::prepare_attention_decode(scratch.context_lens.data(), scratch.block_table.data(), batch_size,
-                                          max_blocks, config_.num_attention_heads,
-                                          runtime_requirements_.kv_cache_head_count,
-                                          runtime_requirements_.kv_cache_head_dim, context);
+        FIREFLY_TRY(kernels::prepare_attention_decode(
+            scratch.context_lens.data(), scratch.block_table.data(), batch_size, max_blocks,
+            config_.num_attention_heads, runtime_requirements_.kv_cache_head_count,
+            runtime_requirements_.kv_cache_head_dim, context));
     }
 #ifdef FIREFLY_ENABLE_RUNTIME_PROFILING
     if (gpu_events) cudaEventRecord(gpu_events->h2d_stop, profile_stream);
@@ -198,8 +209,13 @@ void Engine::process_dynamic_decode(const std::vector<scheduler::SequencePtr>& r
                                   {k_caches_, v_caches_, kv_scale_caches_,
                                    static_cast<int*>(d_block_table_tensor.data()), max_blocks},
                                   static_cast<int*>(d_state_slots.data())};
+    Tensor layered_hidden_states;
     model::ForwardOptions forward_options{
-        .context = context, .prefer_split_decode = prefer_split_decode, .max_decode_context_len = max_context_length};
+        .context = context,
+        .prefer_split_decode = prefer_split_decode, .max_decode_context_len = max_context_length};
+    if (speculative_decoder_ != nullptr)
+        FIREFLY_TRY(speculative_decoder_->configure_target_forward(forward_options, layered_hidden_states,
+                                                                   batch_size, 1));
     Tensor next_tokens =
         Tensor::from_external(decode_fb_next_token_storage_.data(), {batch_size}, DType::I32, Device::CUDA);
     const bool use_flashinfer_graph = runtime_requirements_.cuda_graph &&
@@ -214,15 +230,25 @@ void Engine::process_dynamic_decode(const std::vector<scheduler::SequencePtr>& r
             quantized_decode_max_blocks_ != max_blocks || quantized_decode_context_bucket_ != quantized_context_bucket;
         if (graph_shape_changed)
         {
-            kernels::reserve_paged_decode_scratch(batch_size, config_.num_attention_heads, max_blocks,
-                                                  config_.head_dim);
+            FIREFLY_TRY(kernels::reserve_paged_decode_scratch(batch_size, config_.num_attention_heads, max_blocks,
+                                                              config_.head_dim));
             quantized_decode_graph_ = device::Graph{};
+            quantized_decode_layered_hidden_states_ = std::move(layered_hidden_states);
+            if (speculative_decoder_ != nullptr)
+            {
+                forward_options.hidden_state_layers = speculative_decoder_->target_hidden_layers();
+                forward_options.layered_hidden_state_output = &quantized_decode_layered_hidden_states_;
+                layered_hidden_states = Tensor::from_external(
+                    quantized_decode_layered_hidden_states_.data(), quantized_decode_layered_hidden_states_.shape(),
+                    quantized_decode_layered_hidden_states_.dtype(), Device::CUDA);
+            }
             auto capture_result =
                 quantized_decode_graph_.capture(decode_stream,
-                                                [&]()
+                                                [&]() -> Status
                                                 {
-                                                    Tensor graph_logits = model_->forward(model_input, forward_options);
-                                                    kernels::argmax(graph_logits, next_tokens, context);
+                                                    Tensor graph_logits = FIREFLY_TRY(
+                                                        model_->forward(model_input, forward_options));
+                                                    return kernels::argmax(graph_logits, next_tokens, context);
                                                 });
             if (capture_result)
             {
@@ -241,6 +267,10 @@ void Engine::process_dynamic_decode(const std::vector<scheduler::SequencePtr>& r
         {
             auto launch_result = quantized_decode_graph_.launch(decode_stream);
             graph_launched = launch_result.has_value();
+            if (graph_launched && speculative_decoder_ != nullptr)
+                layered_hidden_states = Tensor::from_external(
+                    quantized_decode_layered_hidden_states_.data(), quantized_decode_layered_hidden_states_.shape(),
+                    quantized_decode_layered_hidden_states_.dtype(), Device::CUDA);
         }
     }
     else if (use_flashinfer_graph)
@@ -256,12 +286,21 @@ void Engine::process_dynamic_decode(const std::vector<scheduler::SequencePtr>& r
         if (graph_shape_changed)
         {
             flashinfer_decode_graph_ = device::Graph{};
+            flashinfer_decode_layered_hidden_states_ = std::move(layered_hidden_states);
+            if (speculative_decoder_ != nullptr)
+            {
+                forward_options.hidden_state_layers = speculative_decoder_->target_hidden_layers();
+                forward_options.layered_hidden_state_output = &flashinfer_decode_layered_hidden_states_;
+                layered_hidden_states = Tensor::from_external(
+                    flashinfer_decode_layered_hidden_states_.data(), flashinfer_decode_layered_hidden_states_.shape(),
+                    flashinfer_decode_layered_hidden_states_.dtype(), Device::CUDA);
+            }
             auto capture_result = flashinfer_decode_graph_.capture(
                 decode_stream,
-                [&]()
+                [&]() -> Status
                 {
-                    Tensor graph_logits = model_->forward(model_input, forward_options);
-                    kernels::argmax(graph_logits, next_tokens, context);
+                    Tensor graph_logits = FIREFLY_TRY(model_->forward(model_input, forward_options));
+                    return kernels::argmax(graph_logits, next_tokens, context);
                 });
             if (capture_result)
             {
@@ -280,13 +319,20 @@ void Engine::process_dynamic_decode(const std::vector<scheduler::SequencePtr>& r
         {
             auto launch_result = flashinfer_decode_graph_.launch(decode_stream);
             graph_launched = launch_result.has_value();
+            if (graph_launched && speculative_decoder_ != nullptr)
+                layered_hidden_states = Tensor::from_external(
+                    flashinfer_decode_layered_hidden_states_.data(), flashinfer_decode_layered_hidden_states_.shape(),
+                    flashinfer_decode_layered_hidden_states_.dtype(), Device::CUDA);
         }
     }
     if (!graph_launched)
     {
-        Tensor logits = model_->forward(model_input, forward_options);
-        kernels::argmax(logits, next_tokens, context);
+        Tensor logits = FIREFLY_TRY_CONTEXT(model_->forward(model_input, forward_options),
+                                            "execute dynamic decode forward");
+        FIREFLY_TRY(kernels::argmax(logits, next_tokens, context));
     }
+    if (speculative_decoder_ != nullptr)
+        FIREFLY_TRY(speculative_decoder_->capture_target_context(layered_hidden_states, requests, 1, context));
     FIREFLY_LOG_DEBUG("decode", "forward complete batch={} graph={}", batch_size, graph_launched);
 #ifdef FIREFLY_ENABLE_RUNTIME_PROFILING
     if (gpu_events) cudaEventRecord(gpu_events->fwd_stop, profile_stream);
@@ -298,14 +344,13 @@ void Engine::process_dynamic_decode(const std::vector<scheduler::SequencePtr>& r
 #endif
 
     scratch.next_tokens.resize(batch_size);
-    cudaMemcpyAsync(scratch.next_tokens.data(), next_tokens.data(), scratch.next_tokens.size() * sizeof(int),
-                    cudaMemcpyDeviceToHost, decode_stream);
+    FIREFLY_TRY(device::check_cuda(
+        cudaMemcpyAsync(scratch.next_tokens.data(), next_tokens.data(), scratch.next_tokens.size() * sizeof(int),
+                        cudaMemcpyDeviceToHost, decode_stream),
+        "copy dynamic decode output tokens"));
     FIREFLY_LOG_DEBUG("decode", "synchronize begin batch={} max_context={}", batch_size, max_context_length);
     const cudaError_t sync_error = cudaStreamSynchronize(decode_stream);
-    if (sync_error != cudaSuccess)
-    {
-        throw std::runtime_error(std::string("decode synchronization failed: ") + cudaGetErrorString(sync_error));
-    }
+    FIREFLY_TRY(device::check_cuda(sync_error, "synchronize dynamic decode output"));
     FIREFLY_LOG_DEBUG("decode", "synchronize complete batch={} max_context={}", batch_size, max_context_length);
 #ifdef FIREFLY_ENABLE_RUNTIME_PROFILING
     if (gpu_events) cudaEventRecord(gpu_events->d2h_stop, profile_stream);
@@ -362,5 +407,6 @@ void Engine::process_dynamic_decode(const std::vector<scheduler::SequencePtr>& r
         }
     }
 #endif
+    return {};
 }
 }  // namespace firefly::execution

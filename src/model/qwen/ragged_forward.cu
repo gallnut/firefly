@@ -10,6 +10,7 @@
 #include "firefly/kernels/attention/ragged_attention.h"
 #include "firefly/kernels/transformer/linear.h"
 #include "firefly/kernels/transformer/rms_norm.h"
+#include "firefly/device/error.h"
 
 namespace firefly::model::qwen
 {
@@ -18,8 +19,8 @@ namespace
 constexpr int page_size = 16;
 }  // namespace
 
-RaggedForwardState prepare_ragged_forward(const QwenModel& model, const ModelInput& input,
-                                          const ForwardOptions& options)
+Result<RaggedForwardState> prepare_ragged_forward(const QwenModel& model, const ModelInput& input,
+                                                  const ForwardOptions& options)
 {
     RaggedForwardState state;
     state.batch = static_cast<int>(input.context_lens.numel());
@@ -34,23 +35,30 @@ RaggedForwardState prepare_ragged_forward(const QwenModel& model, const ModelInp
 
     state.host_seq_offsets.resize(state.batch + 1);
     state.host_seq_lengths.resize(state.batch);
-    cudaMemcpy(state.host_seq_offsets.data(), seq_offsets, (state.batch + 1) * sizeof(int), cudaMemcpyDeviceToHost);
-    cudaMemcpy(state.host_seq_lengths.data(), seq_lengths, state.batch * sizeof(int), cudaMemcpyDeviceToHost);
+    FIREFLY_TRY(device::check_cuda(cudaMemcpy(state.host_seq_offsets.data(), seq_offsets,
+                                              (state.batch + 1) * sizeof(int), cudaMemcpyDeviceToHost),
+                                   "copy ragged sequence offsets to host"));
+    FIREFLY_TRY(device::check_cuda(cudaMemcpy(state.host_seq_lengths.data(), seq_lengths,
+                                              state.batch * sizeof(int), cudaMemcpyDeviceToHost),
+                                   "copy ragged sequence lengths to host"));
     for (int i = 0; i < state.batch; ++i)
     {
         state.max_seq_len = std::max(state.max_seq_len, state.host_seq_lengths[i]);
         if (state.host_seq_lengths[i] == 1) ++state.decode_count;
     }
 
-    state.positions = Tensor({state.total_tokens}, DType::I32, Device::CUDA, options.context);
-    kernels::fill_ragged_positions(state.positions, seq_offsets, seq_lengths, context_lens, state.batch,
-                                   state.total_tokens, options.context);
+    state.positions = FIREFLY_TRY(Tensor::create({state.total_tokens}, DType::I32, Device::CUDA, options.context));
+    FIREFLY_TRY(kernels::fill_ragged_positions(state.positions, seq_offsets, seq_lengths, context_lens,
+                                               state.batch, state.total_tokens, options.context));
 
     state.host_context_lens.resize(state.batch);
     std::vector<int> host_block_table(state.batch * state.max_blocks);
-    cudaMemcpy(state.host_context_lens.data(), context_lens, state.batch * sizeof(int), cudaMemcpyDeviceToHost);
-    cudaMemcpy(host_block_table.data(), input.kv_cache.block_table, host_block_table.size() * sizeof(int),
-               cudaMemcpyDeviceToHost);
+    FIREFLY_TRY(device::check_cuda(cudaMemcpy(state.host_context_lens.data(), context_lens,
+                                              state.batch * sizeof(int), cudaMemcpyDeviceToHost),
+                                   "copy ragged context lengths to host"));
+    FIREFLY_TRY(device::check_cuda(cudaMemcpy(host_block_table.data(), input.kv_cache.block_table,
+                                              host_block_table.size() * sizeof(int), cudaMemcpyDeviceToHost),
+                                   "copy ragged block table to host"));
 
     state.decode_rows.reserve(state.decode_count);
     state.decode_context_lens.reserve(state.decode_count);
@@ -84,62 +92,68 @@ RaggedForwardState prepare_ragged_forward(const QwenModel& model, const ModelInp
 
     if (state.prefill_count > 0)
     {
-        state.prefill_planned = kernels::prepare_attention_prefill_ragged(
+        state.prefill_planned = FIREFLY_TRY(kernels::prepare_attention_prefill_ragged(
             state.prefill_q_indptr, state.prefill_kv_indptr, state.prefill_last_page_len, state.max_blocks,
             model.config.num_attention_heads, model.config.num_key_value_heads, model.config.head_dim,
-            options.context);
+            options.context));
     }
 
-    state.d_decode_rows = Tensor({state.decode_count}, DType::I32, Device::CUDA, options.context);
+    state.d_decode_rows = FIREFLY_TRY(Tensor::create({state.decode_count}, DType::I32, Device::CUDA, options.context));
     cudaMemcpyAsync(state.d_decode_rows.data(), state.decode_rows.data(), state.decode_rows.size() * sizeof(int),
                     cudaMemcpyHostToDevice, options.context.stream());
-    state.d_decode_context_lens = Tensor({state.decode_count}, DType::I32, Device::CUDA, options.context);
-    state.d_decode_block_table = Tensor({static_cast<int64_t>(state.decode_count) * state.max_blocks}, DType::I32,
-                                        Device::CUDA, options.context);
+    state.d_decode_context_lens =
+        FIREFLY_TRY(Tensor::create({state.decode_count}, DType::I32, Device::CUDA, options.context));
+    state.d_decode_block_table = FIREFLY_TRY(Tensor::create(
+        {static_cast<int64_t>(state.decode_count) * state.max_blocks}, DType::I32, Device::CUDA, options.context));
     cudaMemcpyAsync(state.d_decode_context_lens.data(), state.decode_context_lens.data(),
                     state.decode_context_lens.size() * sizeof(int), cudaMemcpyHostToDevice, options.context.stream());
     cudaMemcpyAsync(state.d_decode_block_table.data(), state.decode_block_tables.data(),
                     state.decode_block_tables.size() * sizeof(int), cudaMemcpyHostToDevice,
                     options.context.stream());
 
-    state.decode_q = Tensor({(long)state.decode_count, 1, (long)model.config.num_attention_heads,
-                             (long)model.config.head_dim},
-                            model.config.dtype, Device::CUDA, options.context);
-    state.decode_out = Tensor({(long)state.decode_count, 1,
-                               (long)(model.config.num_attention_heads * model.config.head_dim)},
-                              model.config.dtype, Device::CUDA, options.context);
+    state.decode_q = FIREFLY_TRY(Tensor::create({(long)state.decode_count, 1,
+                                                 (long)model.config.num_attention_heads,
+                                                 (long)model.config.head_dim},
+                                                model.config.dtype, Device::CUDA, options.context));
+    state.decode_out = FIREFLY_TRY(Tensor::create(
+        {(long)state.decode_count, 1, (long)(model.config.num_attention_heads * model.config.head_dim)},
+        model.config.dtype, Device::CUDA, options.context));
     if (state.prefill_count > 0 && !state.prefill_contiguous)
     {
-        state.prefill_q = Tensor({(long)state.prefill_q_rows, 1, (long)model.config.num_attention_heads,
-                                  (long)model.config.head_dim},
-                                 model.config.dtype, Device::CUDA, options.context);
-        state.prefill_out = Tensor(
+        state.prefill_q = FIREFLY_TRY(Tensor::create({(long)state.prefill_q_rows, 1,
+                                                      (long)model.config.num_attention_heads,
+                                                      (long)model.config.head_dim},
+                                                     model.config.dtype, Device::CUDA, options.context));
+        state.prefill_out = FIREFLY_TRY(Tensor::create(
             {(long)state.prefill_q_rows, 1, (long)(model.config.num_attention_heads * model.config.head_dim)},
-            model.config.dtype, Device::CUDA, options.context);
-        state.d_prefill_token_indices = Tensor({(long)state.prefill_q_rows}, DType::I32, Device::CUDA,
-                                               options.context);
+            model.config.dtype, Device::CUDA, options.context));
+        state.d_prefill_token_indices = FIREFLY_TRY(
+            Tensor::create({(long)state.prefill_q_rows}, DType::I32, Device::CUDA, options.context));
         cudaMemcpyAsync(state.d_prefill_token_indices.data(), state.prefill_token_indices.data(),
                         state.prefill_token_indices.size() * sizeof(int), cudaMemcpyHostToDevice,
                         options.context.stream());
     }
-    state.d_last_tokens = Tensor({state.batch}, DType::I32, Device::CUDA, options.context);
+    state.d_last_tokens = FIREFLY_TRY(Tensor::create({state.batch}, DType::I32, Device::CUDA, options.context));
 
     return state;
 }
 
-void run_ragged_attention(const QwenModel& model, const ModelInput& input, RaggedForwardState& state,
-                          int layer_index, Tensor& q, Tensor& attn_out, float scale, const ForwardOptions& options)
+Status run_ragged_attention(const QwenModel& model, const ModelInput& input, RaggedForwardState& state,
+                            int layer_index, Tensor& q, Tensor& attn_out, float scale,
+                            const ForwardOptions& options)
 {
     const int* seq_offsets = input.seq_offsets;
 
     if (state.decode_count > 0)
     {
-        kernels::gather_decode_tokens(q, state.decode_q, seq_offsets,
-                                      static_cast<const int*>(state.d_decode_rows.data()), state.decode_count,
-                                      state.q_elements_per_token, options.context);
-        kernels::prepare_attention_decode(state.decode_context_lens.data(), state.decode_block_tables.data(),
-                                          state.decode_count, state.max_blocks, model.config.num_attention_heads,
-                                          model.config.num_key_value_heads, model.config.head_dim, options.context);
+        FIREFLY_TRY(kernels::gather_decode_tokens(q, state.decode_q, seq_offsets,
+                                                  static_cast<const int*>(state.d_decode_rows.data()),
+                                                  state.decode_count, state.q_elements_per_token,
+                                                  options.context));
+        FIREFLY_TRY(kernels::prepare_attention_decode(
+            state.decode_context_lens.data(), state.decode_block_tables.data(), state.decode_count,
+            state.max_blocks, model.config.num_attention_heads, model.config.num_key_value_heads,
+            model.config.head_dim, options.context));
         kernels::AttentionOptions decode_options{
             .backend = kernels::AttentionBackend::FlashInfer,
             .block_table = static_cast<const int*>(state.d_decode_block_table.data()),
@@ -147,12 +161,13 @@ void run_ragged_attention(const QwenModel& model, const ModelInput& input, Ragge
             .kv_head_count = model.config.num_key_value_heads,
             .max_context_blocks = state.max_blocks,
         };
-        kernels::attention(state.decode_q, input.kv_cache.key_layers[layer_index],
-                           input.kv_cache.value_layers[layer_index], state.decode_out, decode_options,
-                           options.context);
-        kernels::scatter_decode_tokens(state.decode_out, attn_out, seq_offsets,
-                                       static_cast<const int*>(state.d_decode_rows.data()), state.decode_count,
-                                       state.out_elements_per_token, options.context);
+        FIREFLY_TRY(kernels::attention(state.decode_q, input.kv_cache.key_layers[layer_index],
+                                       input.kv_cache.value_layers[layer_index], state.decode_out, decode_options,
+                                       options.context));
+        FIREFLY_TRY(kernels::scatter_decode_tokens(state.decode_out, attn_out, seq_offsets,
+                                                   static_cast<const int*>(state.d_decode_rows.data()),
+                                                   state.decode_count, state.out_elements_per_token,
+                                                   options.context));
     }
 
     bool prefill_launched = false;
@@ -173,9 +188,9 @@ void run_ragged_attention(const QwenModel& model, const ModelInput& input, Ragge
         }
         else
         {
-            kernels::gather_prefill_tokens(q, state.prefill_q,
-                                           static_cast<const int*>(state.d_prefill_token_indices.data()),
-                                           state.prefill_q_rows, state.q_elements_per_token, options.context);
+            FIREFLY_TRY(kernels::gather_prefill_tokens(
+                q, state.prefill_q, static_cast<const int*>(state.d_prefill_token_indices.data()),
+                state.prefill_q_rows, state.q_elements_per_token, options.context));
             batch_q = Tensor::from_external(state.prefill_q.data(),
                                             {state.prefill_q_rows, 1, model.config.num_attention_heads,
                                              model.config.head_dim},
@@ -185,14 +200,14 @@ void run_ragged_attention(const QwenModel& model, const ModelInput& input, Ragge
                 {state.prefill_q_rows, 1, model.config.num_attention_heads * model.config.head_dim},
                 model.config.dtype, Device::CUDA);
         }
-        prefill_launched = kernels::launch_attention_prefill_ragged(
+        prefill_launched = FIREFLY_TRY(kernels::launch_attention_prefill_ragged(
             batch_q, input.kv_cache.key_layers[layer_index], input.kv_cache.value_layers[layer_index], batch_out,
-            input.kv_cache.block_table, model.config.num_key_value_heads, state.max_blocks, scale, options.context);
+            input.kv_cache.block_table, model.config.num_key_value_heads, state.max_blocks, scale, options.context));
         if (prefill_launched && !state.prefill_contiguous)
         {
-            kernels::scatter_prefill_tokens(state.prefill_out, attn_out,
-                                            static_cast<const int*>(state.d_prefill_token_indices.data()),
-                                            state.prefill_q_rows, state.out_elements_per_token, options.context);
+            FIREFLY_TRY(kernels::scatter_prefill_tokens(
+                state.prefill_out, attn_out, static_cast<const int*>(state.d_prefill_token_indices.data()),
+                state.prefill_q_rows, state.out_elements_per_token, options.context));
         }
     }
     if (!prefill_launched)
@@ -219,30 +234,34 @@ void run_ragged_attention(const QwenModel& model, const ModelInput& input, Ragge
                 .max_context_blocks = state.max_blocks,
                 .prefill_context_length = state.host_context_lens[row],
             };
-            kernels::attention(row_q, input.kv_cache.key_layers[layer_index],
-                               input.kv_cache.value_layers[layer_index], row_out, row_options, options.context);
+            FIREFLY_TRY(kernels::attention(row_q, input.kv_cache.key_layers[layer_index],
+                                           input.kv_cache.value_layers[layer_index], row_out, row_options,
+                                           options.context));
         }
     }
+    return {};
 }
 
-Tensor finish_ragged_forward(const QwenModel& model, RaggedForwardState& state, Tensor& hidden_states,
-                             const ForwardOptions& options)
+Result<Tensor> finish_ragged_forward(const QwenModel& model, RaggedForwardState& state, Tensor& hidden_states,
+                                     const ForwardOptions& options)
 {
-    Tensor last_hidden({(long)state.batch, 1, (long)model.config.hidden_size}, model.config.dtype, Device::CUDA,
-                       options.context);
-    Tensor final_norm_out({(long)state.batch, 1, (long)model.config.hidden_size}, model.config.dtype, Device::CUDA,
-                          options.context);
+    Tensor last_hidden = FIREFLY_TRY(Tensor::create({(long)state.batch, 1, (long)model.config.hidden_size},
+                                                    model.config.dtype, Device::CUDA, options.context));
+    Tensor final_norm_out = FIREFLY_TRY(Tensor::create({(long)state.batch, 1, (long)model.config.hidden_size},
+                                                       model.config.dtype, Device::CUDA, options.context));
     std::vector<int> last_tokens_host(state.batch);
     for (int row = 0; row < state.batch; ++row)
         last_tokens_host[row] = state.host_seq_offsets[row] + state.host_seq_lengths[row] - 1;
     cudaMemcpyAsync(state.d_last_tokens.data(), last_tokens_host.data(), last_tokens_host.size() * sizeof(int),
                     cudaMemcpyHostToDevice, options.context.stream());
-    kernels::gather_last_hidden(hidden_states, last_hidden, model.config.hidden_size,
-                                static_cast<const int*>(state.d_last_tokens.data()), state.batch, options.context);
-    kernels::rms_norm(last_hidden, model.norm, final_norm_out, model.config.rms_norm_eps, options.context);
-    Tensor logits({(long)state.batch, 1, (long)model.config.vocab_size}, model.config.dtype, Device::CUDA,
-                  options.context);
-    kernels::matmul(final_norm_out, model.lm_head, logits, options.context);
+    FIREFLY_TRY(kernels::gather_last_hidden(hidden_states, last_hidden, model.config.hidden_size,
+                                            static_cast<const int*>(state.d_last_tokens.data()), state.batch,
+                                            options.context));
+    FIREFLY_TRY(kernels::rms_norm(last_hidden, model.norm, final_norm_out, model.config.rms_norm_eps,
+                                  options.context));
+    Tensor logits = FIREFLY_TRY(Tensor::create({(long)state.batch, 1, (long)model.config.vocab_size},
+                                               model.config.dtype, Device::CUDA, options.context));
+    FIREFLY_TRY(kernels::matmul(final_norm_out, model.lm_head, logits, options.context));
     return logits;
 }
 

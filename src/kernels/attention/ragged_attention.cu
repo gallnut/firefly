@@ -4,19 +4,21 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include <stdexcept>
-
+#include "firefly/device/error.h"
 #include "firefly/core/types.h"
 
 namespace firefly::kernels
 {
 namespace
 {
-void dispatch(const Tensor& tensor, auto&& call)
+Status dispatch(const Tensor& tensor, auto&& call)
 {
     if (tensor.dtype() == DType::BF16) call.template operator()<__nv_bfloat16>();
     else if (tensor.dtype() == DType::F16) call.template operator()<half>();
-    else throw std::runtime_error("ragged attention supports only F16/BF16");
+    else return unexpected(Error{ErrorCode::InvalidArgument, "ragged attention supports only F16/BF16"});
+    const cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) return unexpected(device::cuda_error(error, "launch ragged attention helper"));
+    return {};
 }
 
 __global__ void fill_positions_kernel(int* positions, const int* seq_offsets, const int* seq_lengths,
@@ -93,19 +95,22 @@ __global__ void gather_last_hidden_kernel(const scalar_t* source, scalar_t* dest
 }
 }  // namespace
 
-void fill_ragged_positions(Tensor& positions, const int* seq_offsets, const int* seq_lengths,
-                           const int* context_lens, int batch, int total_tokens,
-                           const device::Context& context)
+Status fill_ragged_positions(Tensor& positions, const int* seq_offsets, const int* seq_lengths,
+                             const int* context_lens, int batch, int total_tokens,
+                             const device::Context& context)
 {
     fill_positions_kernel<<<(total_tokens + 255) / 256, 256, 0, context.stream()>>>(
         static_cast<int*>(positions.data()), seq_offsets, seq_lengths, context_lens, batch, total_tokens);
+    const cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) return unexpected(device::cuda_error(error, "fill ragged positions"));
+    return {};
 }
 
-void gather_decode_tokens(const Tensor& source, Tensor& destination, const int* seq_offsets,
-                          const int* decode_rows, int decode_count, int elements_per_token,
-                          const device::Context& context)
+Status gather_decode_tokens(const Tensor& source, Tensor& destination, const int* seq_offsets,
+                            const int* decode_rows, int decode_count, int elements_per_token,
+                            const device::Context& context)
 {
-    dispatch(source, [&]<typename scalar_t>()
+    return dispatch(source, [&]<typename scalar_t>()
     {
         gather_single_token_kernel<scalar_t><<<decode_count, 256, 0, context.stream()>>>(
             static_cast<const scalar_t*>(source.data()), static_cast<scalar_t*>(destination.data()), seq_offsets,
@@ -113,11 +118,11 @@ void gather_decode_tokens(const Tensor& source, Tensor& destination, const int* 
     });
 }
 
-void scatter_decode_tokens(const Tensor& source, Tensor& destination, const int* seq_offsets,
-                           const int* decode_rows, int decode_count, int elements_per_token,
-                           const device::Context& context)
+Status scatter_decode_tokens(const Tensor& source, Tensor& destination, const int* seq_offsets,
+                             const int* decode_rows, int decode_count, int elements_per_token,
+                             const device::Context& context)
 {
-    dispatch(source, [&]<typename scalar_t>()
+    return dispatch(source, [&]<typename scalar_t>()
     {
         scatter_single_token_kernel<scalar_t><<<decode_count, 256, 0, context.stream()>>>(
             static_cast<const scalar_t*>(source.data()), static_cast<scalar_t*>(destination.data()), seq_offsets,
@@ -125,10 +130,10 @@ void scatter_decode_tokens(const Tensor& source, Tensor& destination, const int*
     });
 }
 
-void gather_prefill_tokens(const Tensor& source, Tensor& destination, const int* token_indices, int total_rows,
-                           int elements_per_token, const device::Context& context)
+Status gather_prefill_tokens(const Tensor& source, Tensor& destination, const int* token_indices, int total_rows,
+                             int elements_per_token, const device::Context& context)
 {
-    dispatch(source, [&]<typename scalar_t>()
+    return dispatch(source, [&]<typename scalar_t>()
     {
         gather_prefill_tokens_kernel<scalar_t><<<total_rows, 256, 0, context.stream()>>>(
             static_cast<const scalar_t*>(source.data()), static_cast<scalar_t*>(destination.data()), token_indices,
@@ -136,10 +141,10 @@ void gather_prefill_tokens(const Tensor& source, Tensor& destination, const int*
     });
 }
 
-void scatter_prefill_tokens(const Tensor& source, Tensor& destination, const int* token_indices, int total_rows,
-                            int elements_per_token, const device::Context& context)
+Status scatter_prefill_tokens(const Tensor& source, Tensor& destination, const int* token_indices, int total_rows,
+                              int elements_per_token, const device::Context& context)
 {
-    dispatch(source, [&]<typename scalar_t>()
+    return dispatch(source, [&]<typename scalar_t>()
     {
         scatter_prefill_tokens_kernel<scalar_t><<<total_rows, 256, 0, context.stream()>>>(
             static_cast<const scalar_t*>(source.data()), static_cast<scalar_t*>(destination.data()), token_indices,
@@ -147,10 +152,10 @@ void scatter_prefill_tokens(const Tensor& source, Tensor& destination, const int
     });
 }
 
-void gather_last_hidden(const Tensor& source, Tensor& destination, int hidden, const int* last_tokens, int rows,
-                        const device::Context& context)
+Status gather_last_hidden(const Tensor& source, Tensor& destination, int hidden, const int* last_tokens, int rows,
+                          const device::Context& context)
 {
-    dispatch(source, [&]<typename scalar_t>()
+    return dispatch(source, [&]<typename scalar_t>()
     {
         gather_last_hidden_kernel<scalar_t><<<rows, 256, 0, context.stream()>>>(
             static_cast<const scalar_t*>(source.data()), static_cast<scalar_t*>(destination.data()), hidden,

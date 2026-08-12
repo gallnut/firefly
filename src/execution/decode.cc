@@ -6,8 +6,16 @@
 
 namespace firefly::execution
 {
-void Engine::process_decode(const std::vector<scheduler::SequencePtr>& requests, const device::Context& context)
+Status Engine::process_decode(const std::vector<scheduler::SequencePtr>& requests, const device::Context& context)
 {
+    if (requests.empty()) return {};
+    if (speculative_decoder_ != nullptr && speculative_decoder_->can_decode(requests))
+    {
+        FIREFLY_NVTX_PUSH("Engine_Speculative_Decode");
+        Status status = speculative_decoder_->decode(*this, requests, context);
+        FIREFLY_NVTX_POP();
+        return status;
+    }
     int target_batch_size = supported_batch_sizes_.back();
     for (int supported_batch_size : supported_batch_sizes_)
     {
@@ -32,16 +40,19 @@ void Engine::process_decode(const std::vector<scheduler::SequencePtr>& requests,
     if (requires_dynamic_graph || dec_graphs_.find(target_batch_size) == dec_graphs_.end())
     {
         FIREFLY_NVTX_PUSH("Engine_Decode_Dynamic");
-        process_dynamic_decode(requests, max_context_length, prefer_split_decode, context);
+        Status status = process_dynamic_decode(requests, max_context_length, prefer_split_decode, context);
         FIREFLY_NVTX_POP();
-        return;
+        return status;
     }
 
-    if (!process_static_decode_graph(requests, target_batch_size, context))
+    bool graph_launched = FIREFLY_TRY(process_static_decode_graph(requests, target_batch_size, context));
+    if (!graph_launched)
     {
         FIREFLY_NVTX_PUSH("Engine_Decode_Dynamic");
-        process_dynamic_decode(requests, max_context_length, false, context);
+        Status status = process_dynamic_decode(requests, max_context_length, false, context);
         FIREFLY_NVTX_POP();
+        return status;
     }
+    return {};
 }
 }  // namespace firefly::execution

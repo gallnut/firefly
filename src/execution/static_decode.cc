@@ -4,13 +4,14 @@
 #include <chrono>
 
 #include "firefly/core/logging.h"
+#include "firefly/device/error.h"
 #include "firefly/execution/engine.h"
 #include "firefly/execution/trace.h"
 
 namespace firefly::execution
 {
-bool Engine::process_static_decode_graph(const std::vector<scheduler::SequencePtr>& requests, int target_batch_size,
-                                         const device::Context& context)
+Result<bool> Engine::process_static_decode_graph(const std::vector<scheduler::SequencePtr>& requests,
+                                                 int target_batch_size, const device::Context& context)
 {
     cudaStream_t stream = context.stream();
     int          batch_size = requests.size();
@@ -44,12 +45,16 @@ bool Engine::process_static_decode_graph(const std::vector<scheduler::SequencePt
 #ifdef FIREFLY_ENABLE_RUNTIME_PROFILING
     auto d0 = std::chrono::high_resolution_clock::now();
 #endif
-    cudaMemcpyAsync(gd.input_ids.data(), gd.h_input_ids, target_batch_size * sizeof(int), cudaMemcpyHostToDevice,
-                    stream);
-    cudaMemcpyAsync(gd.context_lens.data(), gd.h_context_lens, target_batch_size * sizeof(int), cudaMemcpyHostToDevice,
-                    stream);
-    cudaMemcpyAsync(gd.block_table.data(), gd.h_block_table, target_batch_size * max_context_blocks_ * sizeof(int),
-                    cudaMemcpyHostToDevice, stream);
+    FIREFLY_TRY(device::check_cuda(cudaMemcpyAsync(gd.input_ids.data(), gd.h_input_ids,
+                                                   target_batch_size * sizeof(int), cudaMemcpyHostToDevice, stream),
+                                   "copy static decode token IDs"));
+    FIREFLY_TRY(device::check_cuda(cudaMemcpyAsync(gd.context_lens.data(), gd.h_context_lens,
+                                                   target_batch_size * sizeof(int), cudaMemcpyHostToDevice, stream),
+                                   "copy static decode context lengths"));
+    FIREFLY_TRY(device::check_cuda(
+        cudaMemcpyAsync(gd.block_table.data(), gd.h_block_table,
+                        target_batch_size * max_context_blocks_ * sizeof(int), cudaMemcpyHostToDevice, stream),
+        "copy static decode block table"));
 
 #ifdef FIREFLY_ENABLE_RUNTIME_PROFILING
     auto d1 = std::chrono::high_resolution_clock::now();
@@ -61,27 +66,32 @@ bool Engine::process_static_decode_graph(const std::vector<scheduler::SequencePt
     auto result = gd.graph.launch(stream);
     if (!result)
     {
-        FIREFLY_LOG_ERROR("runtime", "decode graph launch failed error={}", result.error().description());
+        FIREFLY_LOG_ERROR("runtime", "decode graph launch failed error={}", result.error().describe());
         FIREFLY_NVTX_POP();
-        return false;
+        return unexpected(std::move(result.error()).with_context("launch static decode graph"));
     }
 #ifdef FIREFLY_ENABLE_RUNTIME_PROFILING
     auto d2 = std::chrono::high_resolution_clock::now();
 #endif
 
     // Extract tokens back to host
-    cudaMemcpyAsync(gd.h_next_tokens, gd.next_tokens.data(), target_batch_size * sizeof(int), cudaMemcpyDeviceToHost,
-                    stream);
+    FIREFLY_TRY(device::check_cuda(cudaMemcpyAsync(gd.h_next_tokens, gd.next_tokens.data(),
+                                                   target_batch_size * sizeof(int), cudaMemcpyDeviceToHost, stream),
+                                   "copy static decode output tokens"));
 #ifdef FIREFLY_ENABLE_RUNTIME_PROFILING
     auto d3 = std::chrono::high_resolution_clock::now();
 #endif
 
     // Synchronize before reading host elements
-    cudaStreamSynchronize(stream);
+    FIREFLY_TRY(device::check_cuda(cudaStreamSynchronize(stream), "synchronize static decode graph"));
     FIREFLY_NVTX_POP();
 #ifdef FIREFLY_ENABLE_RUNTIME_PROFILING
     auto d4 = std::chrono::high_resolution_clock::now();
 #endif
+
+    if (speculative_decoder_ != nullptr)
+        FIREFLY_TRY(speculative_decoder_->capture_target_context(gd.layered_hidden_states, requests, 1, context, -1,
+                                                                 target_batch_size));
 
     for (int i = 0; i < batch_size; ++i)
     {

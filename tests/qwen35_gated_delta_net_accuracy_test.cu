@@ -9,12 +9,18 @@
 #include <vector>
 
 #include "firefly/kernels/linear_attention/gated_delta_net.h"
+#include "test_support.h"
 
 namespace
 {
 using firefly::Device;
 using firefly::DType;
 using firefly::Tensor;
+
+Tensor make_tensor(std::vector<int64_t> shape, DType dtype)
+{
+    return firefly::test::require_tensor(Tensor::create(std::move(shape), dtype, Device::CUDA));
+}
 
 float random_value(uint32_t& state, float scale, float bias = 0.0f)
 {
@@ -78,21 +84,21 @@ bool run_case(int sequence_length, int initial_context, int head_count = 2)
     const int projected_width = head_count * head_dimension * 3;
     const int output_width = head_count * head_dimension;
 
-    Tensor mixed_qkv({batch, sequence_length, projected_width}, DType::BF16, Device::CUDA);
-    Tensor gate({batch, sequence_length, output_width}, DType::BF16, Device::CUDA);
-    Tensor decay({batch, sequence_length, head_count}, DType::BF16, Device::CUDA);
-    Tensor beta({batch, sequence_length, head_count}, DType::BF16, Device::CUDA);
-    Tensor decay_log({head_count}, DType::F32, Device::CUDA);
-    Tensor decay_bias({head_count}, DType::BF16, Device::CUDA);
-    Tensor norm_weight({head_dimension}, DType::F32, Device::CUDA);
-    Tensor initial_state({batch, head_count, head_dimension, head_dimension}, DType::BF16, Device::CUDA);
-    Tensor prefill_state({batch, head_count, head_dimension, head_dimension}, DType::BF16, Device::CUDA);
-    Tensor reference_state({batch, head_count, head_dimension, head_dimension}, DType::BF16, Device::CUDA);
-    Tensor prefill_output({batch, sequence_length, output_width}, DType::BF16, Device::CUDA);
-    Tensor reference_output({batch, sequence_length, output_width}, DType::BF16, Device::CUDA);
+    Tensor mixed_qkv = make_tensor({batch, sequence_length, projected_width}, DType::BF16);
+    Tensor gate = make_tensor({batch, sequence_length, output_width}, DType::BF16);
+    Tensor decay = make_tensor({batch, sequence_length, head_count}, DType::BF16);
+    Tensor beta = make_tensor({batch, sequence_length, head_count}, DType::BF16);
+    Tensor decay_log = make_tensor({head_count}, DType::F32);
+    Tensor decay_bias = make_tensor({head_count}, DType::BF16);
+    Tensor norm_weight = make_tensor({head_dimension}, DType::F32);
+    Tensor initial_state = make_tensor({batch, head_count, head_dimension, head_dimension}, DType::BF16);
+    Tensor prefill_state = make_tensor({batch, head_count, head_dimension, head_dimension}, DType::BF16);
+    Tensor reference_state = make_tensor({batch, head_count, head_dimension, head_dimension}, DType::BF16);
+    Tensor prefill_output = make_tensor({batch, sequence_length, output_width}, DType::BF16);
+    Tensor reference_output = make_tensor({batch, sequence_length, output_width}, DType::BF16);
     firefly::kernels::linear_attention::GatedDeltaNetWorkspace workspace;
-    Tensor state_slots({batch}, DType::I32, Device::CUDA);
-    Tensor context_lengths({batch}, DType::I32, Device::CUDA);
+    Tensor state_slots = make_tensor({batch}, DType::I32);
+    Tensor context_lengths = make_tensor({batch}, DType::I32);
 
     fill_bf16(mixed_qkv, 0x12345678U + sequence_length, 0.35f);
     fill_bf16(gate, 0x23456789U + sequence_length, 0.5f);
@@ -174,15 +180,15 @@ bool run_convolution_case(int sequence_length, int initial_context)
     constexpr int batch = 1;
     constexpr int channels = 96;
     constexpr int kernel_size = 4;
-    Tensor input({batch, sequence_length, channels}, DType::BF16, Device::CUDA);
-    Tensor weight({channels, kernel_size}, DType::BF16, Device::CUDA);
-    Tensor initial_state({batch, channels, kernel_size}, DType::BF16, Device::CUDA);
-    Tensor prefill_state({batch, channels, kernel_size}, DType::BF16, Device::CUDA);
-    Tensor reference_state({batch, channels, kernel_size}, DType::BF16, Device::CUDA);
-    Tensor prefill_output({batch, sequence_length, channels}, DType::BF16, Device::CUDA);
-    Tensor reference_output({batch, sequence_length, channels}, DType::BF16, Device::CUDA);
-    Tensor state_slots({batch}, DType::I32, Device::CUDA);
-    Tensor context_lengths({batch}, DType::I32, Device::CUDA);
+    Tensor input = make_tensor({batch, sequence_length, channels}, DType::BF16);
+    Tensor weight = make_tensor({channels, kernel_size}, DType::BF16);
+    Tensor initial_state = make_tensor({batch, channels, kernel_size}, DType::BF16);
+    Tensor prefill_state = make_tensor({batch, channels, kernel_size}, DType::BF16);
+    Tensor reference_state = make_tensor({batch, channels, kernel_size}, DType::BF16);
+    Tensor prefill_output = make_tensor({batch, sequence_length, channels}, DType::BF16);
+    Tensor reference_output = make_tensor({batch, sequence_length, channels}, DType::BF16);
+    Tensor state_slots = make_tensor({batch}, DType::I32);
+    Tensor context_lengths = make_tensor({batch}, DType::I32);
     fill_bf16(input, 0x10203040U + sequence_length, 0.4f);
     fill_bf16(weight, 0x20304050U, 0.3f);
     fill_bf16(initial_state, 0x30405060U, 0.2f);

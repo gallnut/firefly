@@ -15,7 +15,8 @@ namespace
 {
 template <typename scalar_t>
 __global__ void causal_attention_scalar_kernel(const scalar_t* Q, const scalar_t* K, const scalar_t* V, scalar_t* O,
-                                               int seq_len, int num_heads, int num_kv_heads, int head_dim, float scale)
+                                               int query_len, int kv_len, int num_heads, int num_kv_heads,
+                                               int head_dim, float scale, bool causal)
 {
     extern __shared__ float reduce[];
     __shared__ float        online_softmax[4];
@@ -27,8 +28,8 @@ __global__ void causal_attention_scalar_kernel(const scalar_t* Q, const scalar_t
 
     int kv_head_idx = head_idx / (num_heads / num_kv_heads);
 
-    int64_t stride_b_q = (int64_t)seq_len * num_heads * head_dim;
-    int64_t stride_b_kv = (int64_t)seq_len * num_kv_heads * head_dim;
+    int64_t stride_b_q = (int64_t)query_len * num_heads * head_dim;
+    int64_t stride_b_kv = (int64_t)kv_len * num_kv_heads * head_dim;
     int64_t stride_s_q = num_heads * head_dim;
     int64_t stride_s_kv = num_kv_heads * head_dim;
 
@@ -45,7 +46,8 @@ __global__ void causal_attention_scalar_kernel(const scalar_t* Q, const scalar_t
     }
     __syncthreads();
 
-    for (int key_idx = 0; key_idx <= query_idx; ++key_idx)
+    const int key_limit = causal ? query_idx + 1 : kv_len;
+    for (int key_idx = 0; key_idx < key_limit; ++key_idx)
     {
         const scalar_t* k_ptr = k_base + key_idx * stride_s_kv;
 
@@ -93,37 +95,44 @@ __global__ void causal_attention_scalar_kernel(const scalar_t* Q, const scalar_t
 }
 
 template <typename scalar_t>
-void launch_scalar_prefill(Tensor& q, Tensor& k, Tensor& v, Tensor& output, int kv_head_num, int seq_len,
-                           int batch_size, int num_heads, int head_dim, float scale, cudaStream_t stream)
+Status launch_scalar_prefill(Tensor& q, Tensor& k, Tensor& v, Tensor& output, int kv_head_num, int query_len,
+                           int kv_len,
+                           int batch_size, int num_heads, int head_dim, float scale, bool causal,
+                           cudaStream_t stream)
 {
-    int    threads = attention_detail::thread_count(head_dim);
+    int    threads = FIREFLY_TRY(attention_detail::thread_count(head_dim));
     dim3   block(threads);
-    dim3   grid(seq_len, num_heads, batch_size);
+    dim3   grid(query_len, num_heads, batch_size);
     size_t smem_size = threads * sizeof(float);
 
     causal_attention_scalar_kernel<scalar_t><<<grid, block, smem_size, stream>>>(
         static_cast<const scalar_t*>(q.data()), static_cast<const scalar_t*>(k.data()),
-        static_cast<const scalar_t*>(v.data()), static_cast<scalar_t*>(output.data()), seq_len, num_heads, kv_head_num,
-        head_dim, scale);
+        static_cast<const scalar_t*>(v.data()), static_cast<scalar_t*>(output.data()), query_len, kv_len, num_heads,
+        kv_head_num, head_dim, scale, causal);
+    return {};
 }
 }  // namespace
 
-void attention_detail::launch_contiguous(Tensor& query, Tensor& key, Tensor& value, Tensor& output,
-                                         const AttentionOptions& options, float scale, const device::Context& context)
+Status attention_detail::launch_contiguous(Tensor& query, Tensor& key, Tensor& value, Tensor& output,
+                                           const AttentionOptions& options, float scale,
+                                           const device::Context& context)
 {
     int batch_size = query.shape()[0];
     int sequence_length = query.shape()[1];
+    int kv_length = key.shape()[1];
     int num_heads = query.shape()[2];
     int head_dim = query.shape()[3];
     if (query.dtype() == DType::BF16)
     {
-        launch_scalar_prefill<__nv_bfloat16>(query, key, value, output, options.kv_head_count, sequence_length,
-                                             batch_size, num_heads, head_dim, scale, context.stream());
+        return launch_scalar_prefill<__nv_bfloat16>(query, key, value, output, options.kv_head_count,
+                                                    sequence_length, kv_length, batch_size, num_heads, head_dim,
+                                                    scale, options.causal, context.stream());
     }
     else
     {
-        launch_scalar_prefill<half>(query, key, value, output, options.kv_head_count, sequence_length, batch_size,
-                                    num_heads, head_dim, scale, context.stream());
+        return launch_scalar_prefill<half>(query, key, value, output, options.kv_head_count, sequence_length,
+                                           kv_length, batch_size, num_heads, head_dim, scale, options.causal,
+                                           context.stream());
     }
 }
 

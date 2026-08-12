@@ -2,7 +2,7 @@
 
 #include <cuda_runtime.h>
 
-#include <stdexcept>
+#include "firefly/core/error.h"
 
 namespace firefly::kernels::attention_detail
 {
@@ -16,12 +16,11 @@ __device__ __forceinline__ float warp_reduce_sum(float value)
     return value;
 }
 
-inline int thread_count(int head_dim)
+inline Result<int> thread_count(int head_dim)
 {
     if (head_dim <= 0 || head_dim > 1024)
-    {
-        throw std::runtime_error("attention currently supports 1 <= head_dim <= 1024");
-    }
+        return unexpected(Error{ErrorCode::InvalidArgument,
+                                "attention currently supports 1 <= head_dim <= 1024"});
 
     int threads = 32;
     while (threads < head_dim) threads <<= 1;

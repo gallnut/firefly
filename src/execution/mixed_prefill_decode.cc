@@ -4,14 +4,16 @@
 #include <vector>
 
 #include "firefly/execution/engine.h"
+#include "firefly/device/error.h"
 #include "firefly/kernels/sampling/argmax.h"
 
 namespace firefly::execution
 {
 
-void Engine::process_mixed_batch(const std::vector<scheduler::SequencePtr>& requests,
-                                 const device::Context& context)
+Status Engine::process_mixed_batch(const std::vector<scheduler::SequencePtr>& requests,
+                                   const device::Context& context)
 {
+    if (requests.empty()) return {};
     cudaStream_t stream = context.stream();
     const int    batch_size = static_cast<int>(requests.size());
     int          max_blocks = 0;
@@ -51,13 +53,14 @@ void Engine::process_mixed_batch(const std::vector<scheduler::SequencePtr>& requ
     }
 
     const int total_tokens = static_cast<int>(flat_tokens.size());
-    Tensor d_input({total_tokens, 1}, DType::I32, Device::CUDA, context);
-    Tensor d_context_lens({batch_size}, DType::I32, Device::CUDA, context);
-    Tensor d_seq_offsets({batch_size + 1}, DType::I32, Device::CUDA, context);
-    Tensor d_seq_lengths({batch_size}, DType::I32, Device::CUDA, context);
-    Tensor d_state_slots({batch_size}, DType::I32, Device::CUDA, context);
-    Tensor d_block_table({static_cast<int64_t>(batch_size) * max_blocks}, DType::I32, Device::CUDA, context);
-    Tensor d_next_tokens({batch_size}, DType::I32, Device::CUDA, context);
+    Tensor d_input = FIREFLY_TRY(Tensor::create({total_tokens, 1}, DType::I32, Device::CUDA, context));
+    Tensor d_context_lens = FIREFLY_TRY(Tensor::create({batch_size}, DType::I32, Device::CUDA, context));
+    Tensor d_seq_offsets = FIREFLY_TRY(Tensor::create({batch_size + 1}, DType::I32, Device::CUDA, context));
+    Tensor d_seq_lengths = FIREFLY_TRY(Tensor::create({batch_size}, DType::I32, Device::CUDA, context));
+    Tensor d_state_slots = FIREFLY_TRY(Tensor::create({batch_size}, DType::I32, Device::CUDA, context));
+    Tensor d_block_table = FIREFLY_TRY(Tensor::create(
+        {static_cast<int64_t>(batch_size) * max_blocks}, DType::I32, Device::CUDA, context));
+    Tensor d_next_tokens = FIREFLY_TRY(Tensor::create({batch_size}, DType::I32, Device::CUDA, context));
 
     cudaMemcpyAsync(d_input.data(), flat_tokens.data(), flat_tokens.size() * sizeof(int), cudaMemcpyHostToDevice,
                     stream);
@@ -72,8 +75,7 @@ void Engine::process_mixed_batch(const std::vector<scheduler::SequencePtr>& requ
     cudaMemcpyAsync(d_block_table.data(), block_table.data(), block_table.size() * sizeof(int),
                     cudaMemcpyHostToDevice, stream);
     const cudaError_t copy_status = cudaStreamSynchronize(stream);
-    if (copy_status != cudaSuccess)
-        throw std::runtime_error(std::string("mixed batch H2D failed: ") + cudaGetErrorString(copy_status));
+    FIREFLY_TRY(device::check_cuda(copy_status, "copy mixed batch inputs to device"));
 
     model::ModelInput model_input{
         d_input,
@@ -84,15 +86,21 @@ void Engine::process_mixed_batch(const std::vector<scheduler::SequencePtr>& requ
         static_cast<const int*>(d_seq_lengths.data()),
     };
     model::ForwardOptions forward_options{.context = context};
+    Tensor layered_hidden_states;
+    if (speculative_decoder_ != nullptr)
+        FIREFLY_TRY(speculative_decoder_->configure_target_ragged_forward(forward_options, layered_hidden_states,
+                                                                          total_tokens));
 
-    Tensor logits = model_->forward(model_input, forward_options);
-    kernels::argmax(logits, d_next_tokens, context);
+    Tensor logits = FIREFLY_TRY_CONTEXT(model_->forward(model_input, forward_options), "execute mixed batch forward");
+    if (speculative_decoder_ != nullptr)
+        FIREFLY_TRY(speculative_decoder_->capture_target_context_ragged(
+            layered_hidden_states, requests, std::span(seq_offsets).first(batch_size), seq_lengths, context));
+    FIREFLY_TRY(kernels::argmax(logits, d_next_tokens, context));
     std::vector<int> host_next_tokens(batch_size);
     cudaMemcpyAsync(host_next_tokens.data(), d_next_tokens.data(), host_next_tokens.size() * sizeof(int),
                     cudaMemcpyDeviceToHost, stream);
     const cudaError_t sync_error = cudaStreamSynchronize(stream);
-    if (sync_error != cudaSuccess)
-        throw std::runtime_error(std::string("mixed batch D2H failed: ") + cudaGetErrorString(sync_error));
+    FIREFLY_TRY(device::check_cuda(sync_error, "copy mixed batch outputs to host"));
 
     for (int i = 0; i < batch_size; ++i)
     {
@@ -109,6 +117,7 @@ void Engine::process_mixed_batch(const std::vector<scheduler::SequencePtr>& requ
             request->context_len += 1;
         }
     }
+    return {};
 }
 
 }  // namespace firefly::execution

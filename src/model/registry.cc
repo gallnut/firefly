@@ -1,7 +1,5 @@
 #include "firefly/model/registry.h"
 
-#include <stdexcept>
-
 namespace firefly::model
 {
 
@@ -23,14 +21,14 @@ void ModelRegistry::register_factory(const std::string& architecture_name, Model
     factories_[architecture_name] = std::move(factory);
 }
 
-std::unique_ptr<Model> ModelRegistry::create(const ModelDescriptor& descriptor) const
+Result<std::unique_ptr<Model>> ModelRegistry::create(const ModelDescriptor& descriptor) const
 {
     auto it = factories_.find(descriptor.architecture);
     if (it != factories_.end())
     {
         return it->second(descriptor);
     }
-    throw std::runtime_error("Unknown model architecture: " + descriptor.architecture);
+    return unexpected(Error{ErrorCode::NotFound, "unknown model architecture: " + descriptor.architecture});
 }
 
 }  // namespace firefly::model

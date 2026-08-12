@@ -15,6 +15,7 @@ namespace firefly::device::memory
  * @param bytes Size in bytes to allocate.
  * @param stream The stream to perform allocation on.
  * @return Result<void*> The allocated pointer or error.
+ * @note The returned allocation follows CUDA stream-ordering rules and must be released with `free`.
  */
 inline Result<void*> allocate(size_t bytes, cudaStream_t stream = nullptr)
 {
@@ -22,7 +23,7 @@ inline Result<void*> allocate(size_t bytes, cudaStream_t stream = nullptr)
     cudaError_t err = cudaMallocAsync(&ptr, bytes, stream);
     if (err != cudaSuccess)
     {
-        return unexpected(Error{err, "CUDA OOM: Failed to allocate device memory"});
+        return unexpected(cuda_error(err, "allocate CUDA device memory"));
     }
     return ptr;
 }
@@ -32,6 +33,7 @@ inline Result<void*> allocate(size_t bytes, cudaStream_t stream = nullptr)
  *
  * @param ptr Pointer to free.
  * @param stream The stream to perform deallocation on.
+ * @note A null pointer is accepted. Deallocation is ordered after earlier work in `stream`.
  */
 inline void free(void* ptr, cudaStream_t stream = nullptr)
 {
@@ -47,6 +49,7 @@ inline void free(void* ptr, cudaStream_t stream = nullptr)
  * @param device_id The device ID (-1 for current).
  * @param threshold_bytes The threshold (UINT64_MAX to prevent releasing).
  * @return Result<void> Success or failure.
+ * @note This changes the default CUDA memory pool associated with the selected device.
  */
 inline Result<void> set_release_threshold(int device_id, size_t threshold_bytes)
 {
@@ -54,16 +57,16 @@ inline Result<void> set_release_threshold(int device_id, size_t threshold_bytes)
     if (current_device < 0)
     {
         cudaError_t err = cudaGetDevice(&current_device);
-        if (err != cudaSuccess) return unexpected(Error{err});
+        if (err != cudaSuccess) return unexpected(cuda_error(err, "query current CUDA device"));
     }
 
     cudaMemPool_t mem_pool;
     cudaError_t   err = cudaDeviceGetDefaultMemPool(&mem_pool, current_device);
-    if (err != cudaSuccess) return unexpected(Error{err});
+    if (err != cudaSuccess) return unexpected(cuda_error(err, "get default CUDA memory pool"));
 
     uint64_t threshold = static_cast<uint64_t>(threshold_bytes);
     err = cudaMemPoolSetAttribute(mem_pool, cudaMemPoolAttrReleaseThreshold, &threshold);
-    if (err != cudaSuccess) return unexpected(Error{err});
+    if (err != cudaSuccess) return unexpected(cuda_error(err, "set CUDA memory pool release threshold"));
 
     return {};
 }
@@ -74,16 +77,17 @@ inline Result<void> set_release_threshold(int device_id, size_t threshold_bytes)
  * @param current_device The current device ID.
  * @param peer_device The peer device ID to allow access from.
  * @return Result<void> Success or failure.
+ * @note The function succeeds without changing access when the devices do not support peer access.
  */
 inline Result<void> enable_peer_access(int current_device, int peer_device)
 {
     cudaMemPool_t mem_pool;
     cudaError_t   err = cudaDeviceGetDefaultMemPool(&mem_pool, current_device);
-    if (err != cudaSuccess) return unexpected(Error{err});
+    if (err != cudaSuccess) return unexpected(cuda_error(err, "get CUDA memory pool for peer access"));
 
     int can_access = 0;
     err = cudaDeviceCanAccessPeer(&can_access, current_device, peer_device);
-    if (err != cudaSuccess) return unexpected(Error{err});
+    if (err != cudaSuccess) return unexpected(cuda_error(err, "query CUDA peer access capability"));
 
     if (can_access)
     {
@@ -93,7 +97,11 @@ inline Result<void> enable_peer_access(int current_device, int peer_device)
         desc.flags = cudaMemAccessFlagsProtReadWrite;
 
         err = cudaMemPoolSetAccess(mem_pool, &desc, 1);
-        if (err != cudaSuccess) return unexpected(Error{err});
+        if (err != cudaSuccess) return unexpected(cuda_error(err, "set CUDA memory pool peer access"));
+    }
+    else
+    {
+        return unexpected(Error{ErrorCode::Unavailable, "CUDA peer access is not supported for the device pair"});
     }
 
     return {};

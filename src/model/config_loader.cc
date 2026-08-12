@@ -1,19 +1,28 @@
 #include "firefly/model/config_loader.h"
 
 #include <fstream>
-#include <stdexcept>
 
 #include <nlohmann/json.hpp>
 
 namespace firefly::model
 {
 
-ModelDescriptor load_model_descriptor(const std::string& config_path)
+Result<ModelDescriptor> load_model_descriptor(const std::string& config_path)
 {
     std::ifstream input(config_path);
-    if (!input.is_open()) throw std::runtime_error("Failed to open config file: " + config_path);
+    if (!input.is_open())
+        return unexpected(Error{ErrorCode::Io, "failed to open model config file: " + config_path});
 
-    auto json = nlohmann::json::parse(input);
+    nlohmann::json json;
+    try
+    {
+        json = nlohmann::json::parse(input);
+    }
+    catch (const nlohmann::json::exception& exception)
+    {
+        return unexpected(Error{ErrorCode::Parse, "failed to parse model config " + config_path + ": " +
+                                                      std::string(exception.what())});
+    }
     ModelDescriptor descriptor;
     descriptor.raw_config = json.dump();
     const auto& text = json.contains("text_config") ? json.at("text_config") : json;
@@ -23,6 +32,8 @@ ModelDescriptor load_model_descriptor(const std::string& config_path)
     config.num_hidden_layers = text.value("num_hidden_layers", 0);
     config.num_attention_heads = text.value("num_attention_heads", 0);
     config.num_key_value_heads = text.value("num_key_value_heads", config.num_attention_heads);
+    if (config.num_attention_heads <= 0)
+        return unexpected(Error{ErrorCode::Parse, "model config num_attention_heads must be positive"});
     config.head_dim = text.value("head_dim", config.hidden_size / config.num_attention_heads);
     config.vocab_size = text.value("vocab_size", 0);
     config.max_position_embeddings = text.value("max_position_embeddings", 32768);
@@ -38,6 +49,8 @@ ModelDescriptor load_model_descriptor(const std::string& config_path)
     descriptor.architecture = "Qwen2ForCausalLM";
     if (json.contains("architectures") && json["architectures"].is_array() && !json["architectures"].empty())
         descriptor.architecture = json["architectures"][0].get<std::string>();
+    if (config.hidden_size <= 0 || config.num_hidden_layers <= 0 || config.vocab_size <= 0 || config.head_dim <= 0)
+        return unexpected(Error{ErrorCode::Parse, "model config contains non-positive required dimensions"});
     return descriptor;
 }
 

@@ -4,6 +4,7 @@
 #include <cub/block/block_reduce.cuh>
 
 #include "firefly/core/logging.h"
+#include "firefly/device/error.h"
 #include "firefly/kernels/detail/cuda_scalar.cuh"
 #include "firefly/kernels/sampling/argmax.h"
 
@@ -45,9 +46,12 @@ __global__ void argmax_kernel(const scalar_t* __restrict__ logits, int* __restri
     }
 }
 
-void argmax(const Tensor& logits, Tensor& output_token, const device::Context& context)
+Status argmax(const Tensor& logits, Tensor& output_token, const device::Context& context)
 {
-    require_float16_or_bfloat16(logits.dtype(), "argmax");
+    FIREFLY_TRY(require_float16_or_bfloat16(logits.dtype(), "argmax"));
+    if (logits.shape().empty() || output_token.dtype() != DType::I32 ||
+        output_token.numel() != logits.numel() / logits.shape().back())
+        return unexpected(Error{ErrorCode::InvalidArgument, "argmax output shape or dtype is invalid"});
 
     // logits: [batch_size, vocab_size]
     int batch_size = logits.shape()[0];
@@ -68,11 +72,8 @@ void argmax(const Tensor& logits, Tensor& output_token, const device::Context& c
     }
 
     cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess)
-    {
-        FIREFLY_LOG_ERROR("cuda", "kernel launch failed operation=argmax error={} code={}",
-                          cudaGetErrorString(err), static_cast<int>(err));
-    }
+    if (err != cudaSuccess) return unexpected(device::cuda_error(err, "launch argmax kernel"));
+    return {};
 }
 
 }  // namespace firefly::kernels

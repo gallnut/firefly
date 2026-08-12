@@ -19,7 +19,7 @@ using grpc::Server;
 using grpc::ServerBuilder;
 using grpc::ServerContext;
 using grpc::ServerWriter;
-using grpc::Status;
+using GrpcStatus = grpc::Status;
 using json = nlohmann::json;
 
 namespace firefly
@@ -92,8 +92,8 @@ public:
     {
     }
 
-    Status ChatCompletion(ServerContext *context, const ChatCompletionRequest *request,
-                          ChatCompletionResponse *reply) override
+    GrpcStatus ChatCompletion(ServerContext *context, const ChatCompletionRequest *request,
+                              ChatCompletionResponse *reply) override
     {
         json req_json;
         if (request->max_tokens() > 0) req_json["max_tokens"] = request->max_tokens();
@@ -119,15 +119,7 @@ public:
 
         auto session = std::make_shared<Session>();
 
-        // We run the handler synchronously here (it returns instantly because it just maps req_id & engine.push)
-        try
-        {
-            handler_(req_body, false, session);
-        }
-        catch (const std::exception &e)
-        {
-            return Status(grpc::StatusCode::INTERNAL, e.what());
-        }
+        handler_(req_body, false, session);
 
         std::string full_response;
 
@@ -142,72 +134,68 @@ public:
             session->output_queue.pop();
         }
 
-        try
-        {
-            reply->set_id("chatcmpl-firefly");
-            reply->set_object("chat.completion");
-            reply->set_created(std::time(nullptr));
-            reply->set_model(req_json.value("model", "qwen3"));
+        reply->set_id("chatcmpl-firefly");
+        reply->set_object("chat.completion");
+        reply->set_created(std::time(nullptr));
+        reply->set_model(req_json.value("model", "qwen3"));
 
             // Parse Chain of Thought thinking blocks
-            std::string content = full_response;
-            std::string reasoning_content = "";
+        std::string content = full_response;
+        std::string reasoning_content;
 
-            std::string think_start = "<think>";
-            std::string think_end = "</think>";
+        const std::string think_start = "<think>";
+        const std::string think_end = "</think>";
 
-            size_t start_pos = content.find(think_start);
-            if (start_pos != std::string::npos)
-            {
-                size_t end_pos = content.find(think_end, start_pos + think_start.length());
-                if (end_pos != std::string::npos)
-                {
-                    reasoning_content =
-                        content.substr(start_pos + think_start.length(), end_pos - (start_pos + think_start.length()));
-                    content = content.substr(end_pos + think_end.length());
-                }
-                else
-                {
-                    reasoning_content = content.substr(start_pos + think_start.length());
-                    content = "";
-                }
-
-                auto trim = [](std::string &s)
-                {
-                    s.erase(0, s.find_first_not_of(" \n\r\t"));
-                    s.erase(s.find_last_not_of(" \n\r\t") + 1);
-                };
-                trim(reasoning_content);
-                trim(content);
-            }
-
-            auto *choice = reply->add_choices();
-            choice->set_index(0);
-            choice->set_finish_reason("stop");
-
-            auto *msg = choice->mutable_message();
-            msg->set_role("assistant");
-            msg->set_content(scrub_utf8(content));
-            if (!reasoning_content.empty())
-            {
-                choice->set_reasoning_content(scrub_utf8(reasoning_content));
-            }
-
-            auto *usage = reply->mutable_usage();
-            usage->set_prompt_tokens(session->has_usage ? session->prompt_tokens : 0);
-            usage->set_completion_tokens(session->has_usage ? session->completion_tokens : 0);
-            usage->set_total_tokens(session->has_usage ? session->total_tokens : 0);
-        }
-        catch (const std::exception &e)
+        size_t start_pos = content.find(think_start);
+        if (start_pos != std::string::npos)
         {
-            return Status(grpc::StatusCode::INTERNAL, e.what());
+            size_t end_pos = content.find(think_end, start_pos + think_start.length());
+            if (end_pos != std::string::npos)
+            {
+                reasoning_content =
+                    content.substr(start_pos + think_start.length(), end_pos - (start_pos + think_start.length()));
+                content = content.substr(end_pos + think_end.length());
+            }
+            else
+            {
+                reasoning_content = content.substr(start_pos + think_start.length());
+                content.clear();
+            }
+
+            auto trim = [](std::string &text)
+            {
+                const size_t first = text.find_first_not_of(" \n\r\t");
+                if (first == std::string::npos)
+                {
+                    text.clear();
+                    return;
+                }
+                text.erase(0, first);
+                text.erase(text.find_last_not_of(" \n\r\t") + 1);
+            };
+            trim(reasoning_content);
+            trim(content);
         }
 
-        return Status::OK;
+        auto *choice = reply->add_choices();
+        choice->set_index(0);
+        choice->set_finish_reason("stop");
+
+        auto *msg = choice->mutable_message();
+        msg->set_role("assistant");
+        msg->set_content(scrub_utf8(content));
+        if (!reasoning_content.empty()) choice->set_reasoning_content(scrub_utf8(reasoning_content));
+
+        auto *usage = reply->mutable_usage();
+        usage->set_prompt_tokens(session->has_usage ? session->prompt_tokens : 0);
+        usage->set_completion_tokens(session->has_usage ? session->completion_tokens : 0);
+        usage->set_total_tokens(session->has_usage ? session->total_tokens : 0);
+
+        return GrpcStatus::OK;
     }
 
-    Status ChatCompletionStream(ServerContext *context, const ChatCompletionRequest *request,
-                                ServerWriter<ChatCompletionStreamResponse> *writer) override
+    GrpcStatus ChatCompletionStream(ServerContext *context, const ChatCompletionRequest *request,
+                                    ServerWriter<ChatCompletionStreamResponse> *writer) override
     {
         json req_json;
         if (request->max_tokens() > 0) req_json["max_tokens"] = request->max_tokens();
@@ -232,14 +220,7 @@ public:
         std::string req_body = req_json.dump();
         auto        session = std::make_shared<Session>();
 
-        try
-        {
-            handler_(req_body, true, session);
-        }
-        catch (const std::exception &e)
-        {
-            return Status(grpc::StatusCode::INTERNAL, "Internal Server Error: " + std::string(e.what()));
-        }
+        handler_(req_body, true, session);
 
         bool is_thinking = false;
 
@@ -337,16 +318,18 @@ public:
             if (is_finished) break;
         }
 
-        return Status::OK;
+        return GrpcStatus::OK;
     }
 
 private:
     std::function<void(const std::string &, bool, std::shared_ptr<Session>)> handler_;
 };
 
-bool GrpcAdapter::start_server(int                                                                      port,
-                               std::function<void(const std::string &, bool, std::shared_ptr<Session>)> handler)
+Status GrpcAdapter::start_server(int port,
+                                 std::function<void(const std::string &, bool, std::shared_ptr<Session>)> handler)
 {
+    if (port <= 0 || port > 65535)
+        return unexpected(Error{ErrorCode::InvalidArgument, "gRPC port must be in [1, 65535]"});
     std::string          server_address("0.0.0.0:" + std::to_string(port));
     InferenceServiceImpl service(handler);
 
@@ -358,9 +341,12 @@ bool GrpcAdapter::start_server(int                                              
     builder.RegisterService(&service);
 
     std::unique_ptr<Server> server(builder.BuildAndStart());
+    if (!server)
+        return unexpected(Error{ErrorCode::Unavailable, "failed to bind or start gRPC server at " +
+                                                        server_address});
     FIREFLY_LOG_INFO("service", "gRPC server started address={}", server_address);
     server->Wait();
-    return true;
+    return {};
 }
 
 }  // namespace service

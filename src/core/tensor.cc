@@ -4,6 +4,7 @@
 
 #include <cstring>  // for std::memcpy
 #include <format>
+#include <limits>
 #include <numeric>
 #include <print>
 #include <string>
@@ -12,26 +13,13 @@
 
 #include "firefly/core/types.h"
 #include "firefly/device/allocator.h"
+#include "firefly/device/error.h"
 
 namespace firefly
 {
 
 namespace
 {
-template <typename F>
-auto dispatch_device(Device d, F&& func)
-{
-    switch (d)
-    {
-        case Device::CPU:
-            return func(std::integral_constant<Device, Device::CPU>{});
-        case Device::CUDA:
-            return func(std::integral_constant<Device, Device::CUDA>{});
-        default:
-            throw std::runtime_error("Unknown device type");
-    }
-}
-
 std::string format_shape(const std::vector<int64_t>& shape)
 {
     if (shape.empty()) return "[]";
@@ -122,48 +110,56 @@ std::string tensor_to_string(const Tensor& t)
     return s;
 }
 
+Result<std::pair<std::vector<int64_t>, int64_t>> make_contiguous_layout(const std::vector<int64_t>& shape)
+{
+    std::vector<int64_t> strides(shape.size());
+    int64_t              numel = shape.empty() ? 0 : 1;
+    int64_t              stride = 1;
+    for (int index = static_cast<int>(shape.size()) - 1; index >= 0; --index)
+    {
+        if (shape[index] < 0)
+            return unexpected(Error{ErrorCode::InvalidArgument, "tensor dimensions must be nonnegative"});
+        strides[index] = stride;
+        if (shape[index] != 0 && stride > std::numeric_limits<int64_t>::max() / shape[index])
+            return unexpected(Error{ErrorCode::InvalidArgument, "tensor element count overflows int64"});
+        stride *= shape[index];
+        numel *= shape[index];
+    }
+    return std::pair{std::move(strides), numel};
+}
 }  // namespace
 
-Tensor::Tensor(std::vector<int64_t> shape, DType dtype, Device device, const device::Context& context)
-    : shape_(std::move(shape)), dtype_(dtype), device_(device), allocation_context_(context)
+Tensor::Tensor(std::vector<int64_t> shape, std::vector<int64_t> strides, int64_t numel, DType dtype, Device device,
+               const device::Context& context)
+    : shape_(std::move(shape)), strides_(std::move(strides)), numel_(numel), dtype_(dtype), device_(device),
+      allocation_context_(context)
 {
-    if (!shape_.empty())
-    {
-        strides_.resize(shape_.size());
-        int64_t stride = 1;
-        for (int i = static_cast<int>(shape_.size()) - 1; i >= 0; --i)
-        {
-            strides_[i] = stride;
-            stride *= shape_[i];
-        }
-    }
+}
 
-    numel_ = std::accumulate(shape_.begin(), shape_.end(), 1LL, std::multiplies<int64_t>());
-    size_t bytes = numel_ * element_size(dtype);
-
-    if (bytes > 0)
-    {
-        data_ptr_ = dispatch_device(device, [bytes, stream = allocation_context_.stream()](auto dev_const)
-                                    {
-                                        if constexpr (dev_const.value == Device::CUDA)
-                                            return DeviceAllocator<Device::CUDA>::allocate(bytes, stream);
-                                        else
-                                            return DeviceAllocator<Device::CPU>::allocate(bytes);
-                                    });
-    }
+Result<Tensor> Tensor::create(std::vector<int64_t> shape, DType dtype, Device device, const device::Context& context)
+{
+    if (dtype == DType::UNKNOWN || element_size(dtype) == 0)
+        return unexpected(Error{ErrorCode::InvalidArgument, "cannot allocate tensor with unknown dtype"});
+    auto layout = FIREFLY_TRY_CONTEXT(make_contiguous_layout(shape), "compute contiguous tensor layout");
+    Tensor tensor(std::move(shape), std::move(layout.first), layout.second, dtype, device, context);
+    const size_t bytes = tensor.nbytes();
+    if (bytes == 0) return tensor;
+    if (device == Device::CPU)
+        tensor.data_ptr_ = FIREFLY_TRY_CONTEXT(DeviceAllocator<Device::CPU>::allocate(bytes), "allocate CPU tensor");
+    else if (device == Device::CUDA)
+        tensor.data_ptr_ = FIREFLY_TRY_CONTEXT(
+            DeviceAllocator<Device::CUDA>::allocate(bytes, context.stream()), "allocate CUDA tensor");
+    else
+        return unexpected(Error{ErrorCode::InvalidArgument, "unknown tensor device"});
+    return tensor;
 }
 
 Tensor::~Tensor()
 {
     if (data_ptr_ != nullptr && !is_view_)
     {
-        dispatch_device(device_, [ptr = data_ptr_, stream = allocation_context_.stream()](auto dev_const)
-                        {
-                            if constexpr (dev_const.value == Device::CUDA)
-                                DeviceAllocator<Device::CUDA>::free(ptr, stream);
-                            else
-                                DeviceAllocator<Device::CPU>::free(ptr);
-                        });
+        if (device_ == Device::CUDA) DeviceAllocator<Device::CUDA>::free(data_ptr_, allocation_context_.stream());
+        else DeviceAllocator<Device::CPU>::free(data_ptr_);
     }
 }
 
@@ -187,13 +183,8 @@ Tensor& Tensor::operator=(Tensor&& other) noexcept
     {
         if (data_ptr_ != nullptr && !is_view_)
         {
-            dispatch_device(device_, [ptr = data_ptr_, stream = allocation_context_.stream()](auto dev_const)
-                            {
-                                if constexpr (dev_const.value == Device::CUDA)
-                                    DeviceAllocator<Device::CUDA>::free(ptr, stream);
-                                else
-                                    DeviceAllocator<Device::CPU>::free(ptr);
-                            });
+            if (device_ == Device::CUDA) DeviceAllocator<Device::CUDA>::free(data_ptr_, allocation_context_.stream());
+            else DeviceAllocator<Device::CPU>::free(data_ptr_);
         }
 
         data_ptr_ = other.data_ptr_;
@@ -240,10 +231,11 @@ Tensor Tensor::from_external(void* data_ptr, std::vector<int64_t> shape, DType d
     return t;
 }
 
-Tensor Tensor::from_external(void* data_ptr, std::vector<int64_t> shape, std::vector<int64_t> strides, DType dtype,
-                             Device device)
+Result<Tensor> Tensor::from_external(void* data_ptr, std::vector<int64_t> shape, std::vector<int64_t> strides,
+                                     DType dtype, Device device)
 {
-    if (shape.size() != strides.size()) throw std::runtime_error("Tensor view shape and stride rank mismatch");
+    if (shape.size() != strides.size())
+        return unexpected(Error{ErrorCode::InvalidArgument, "tensor view shape and stride ranks differ"});
     Tensor tensor;
     tensor.data_ptr_ = data_ptr;
     tensor.shape_ = std::move(shape);
@@ -255,9 +247,10 @@ Tensor Tensor::from_external(void* data_ptr, std::vector<int64_t> shape, std::ve
     return tensor;
 }
 
-Tensor Tensor::clone() const
+Result<Tensor> Tensor::clone() const
 {
-    Tensor new_tensor(shape_, dtype_, device_, allocation_context_);
+    Tensor new_tensor = FIREFLY_TRY_CONTEXT(Tensor::create(shape_, dtype_, device_, allocation_context_),
+                                            "allocate cloned tensor");
     size_t bytes = numel_ * element_size(dtype_);
 
     if (bytes > 0 && data_ptr_)
@@ -271,35 +264,22 @@ Tensor Tensor::clone() const
             cudaError_t err = cudaMemcpy(new_tensor.data(), data_ptr_, bytes, cudaMemcpyDeviceToDevice);
             if (err != cudaSuccess)
             {
-                throw std::runtime_error("Tensor clone failed: CUDA copy error");
+                return unexpected(device::cuda_error(err, "copy cloned CUDA tensor"));
             }
         }
     }
     return new_tensor;
 }
 
-void Tensor::reshape(std::vector<int64_t> new_shape)
+Status Tensor::reshape(std::vector<int64_t> new_shape)
 {
-    int64_t new_numel = 1;
-    for (auto s : new_shape) new_numel *= s;
-
-    if (new_numel != numel_)
-    {
-        throw std::runtime_error("Reshape: numel mismatch");
-    }
+    auto layout = FIREFLY_TRY_CONTEXT(make_contiguous_layout(new_shape), "compute reshaped tensor layout");
+    if (layout.second != numel_)
+        return unexpected(Error{ErrorCode::InvalidArgument, "reshape changes the tensor element count"});
 
     shape_ = std::move(new_shape);
-
-    if (!shape_.empty())
-    {
-        strides_.resize(shape_.size());
-        int64_t stride = 1;
-        for (int i = static_cast<int>(shape_.size()) - 1; i >= 0; --i)
-        {
-            strides_[i] = stride;
-            stride *= shape_[i];
-        }
-    }
+    strides_ = std::move(layout.first);
+    return {};
 }
 
 void Tensor::print() const { std::println("{}", tensor_to_string(*this)); }

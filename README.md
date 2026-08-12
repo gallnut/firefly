@@ -47,6 +47,16 @@ Key mechanisms:
 
 Supported models: Qwen2 / Qwen3 / Qwen3.5 (hybrid linear attention with Gated Delta Net).
 
+DSpark speculative decoding is available when a trained drafter implementing the `SpeculativeProposer` capability is
+supplied with `--draft-model qwen35_dspark` (or `FIREFLY_SPECULATIVE_MODEL=qwen35_dspark`). Target models opt into
+transactional recurrent-state replay separately, so the generic runner is not coupled to Qwen3.5. When speculative
+decoding is disabled, hidden-layer capture, proposer state, context storage, and scheduler lookahead are not created.
+When enabled, ordinary prefill/decode, FlashInfer, CUDA Graph, KV quantization, prefix cache, and mixed-batch paths keep
+their existing execution routes and feed the same target-context side channel. Confidence pruning uses
+`FIREFLY_SPECULATIVE_CONFIDENCE_THRESHOLD=0.0..1.0`; `FIREFLY_SPECULATIVE_DRAFT_TOKENS` overrides the drafter block
+size. The legacy `FIREFLY_DSPARK_*` variables remain accepted. Multi-request batches currently use the regular decode
+runner until token-level speculative batching is enabled.
+
 Correctness is checked against vLLM under identical configurations. Measured on RTX 4060 Laptop 8GB (Release build,
 FlashInfer backend, Qwen3-0.6B, BF16):
 

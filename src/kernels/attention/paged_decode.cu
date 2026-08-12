@@ -222,21 +222,21 @@ __global__ void paged_decode_split_dual_partial_kernel(const scalar_t* __restric
 }
 
 template <typename scalar_t>
-void launch_paged_decode_split(Tensor& q, Tensor& k, Tensor& v, Tensor& output, const int* kv_cache_block_table,
-                               int kv_head_num, int max_context_blocks, const int* context_lens, int batch_size,
-                               int num_heads, int head_dim, float scale, int max_decode_context_len, int split_size,
-                               cudaStream_t stream)
+Status launch_paged_decode_split(Tensor& q, Tensor& k, Tensor& v, Tensor& output, const int* kv_cache_block_table,
+                                 int kv_head_num, int max_context_blocks, const int* context_lens, int batch_size,
+                                 int num_heads, int head_dim, float scale, int max_decode_context_len, int split_size,
+                                 cudaStream_t stream)
 {
-    auto launch = [&](auto split_tag)
+    auto launch = [&](auto split_tag) -> Status
     {
         constexpr int split_size = decltype(split_tag)::value;
         int split_token_limit = max_decode_context_len > 0 ? max_decode_context_len + 1 : max_context_blocks * 16;
         split_token_limit = std::min(split_token_limit, max_context_blocks * 16);
         int num_splits = std::max(1, (split_token_limit + split_size - 1) / split_size);
-        attention_detail::ensure_decode_workspace(batch_size, num_heads, num_splits, head_dim);
+        FIREFLY_TRY(attention_detail::ensure_decode_workspace(batch_size, num_heads, num_splits, head_dim));
         auto& scratch = attention_detail::decode_workspace();
 
-        int  threads = attention_detail::thread_count(head_dim);
+        int  threads = FIREFLY_TRY(attention_detail::thread_count(head_dim));
         bool use_dual_gqa_decode = num_heads == kv_head_num * 2 && head_dim == 128;
         if (use_dual_gqa_decode)
         {
@@ -279,46 +279,46 @@ void launch_paged_decode_split(Tensor& q, Tensor& k, Tensor& v, Tensor& output, 
                 static_cast<const float*>(scratch.partial_acc.data()), static_cast<scalar_t*>(output.data()), num_heads,
                 head_dim, num_splits);
         }
+        return {};
     };
 
     switch (split_size)
     {
         case 128:
-            launch(std::integral_constant<int, 128>{});
-            break;
+            return launch(std::integral_constant<int, 128>{});
         case 512:
-            launch(std::integral_constant<int, 512>{});
-            break;
+            return launch(std::integral_constant<int, 512>{});
         default:
-            launch(std::integral_constant<int, 256>{});
-            break;
+            return launch(std::integral_constant<int, 256>{});
     }
 }
 
 template <typename Scalar>
-void launch_paged_decode_typed(Tensor& query, Tensor& key, Tensor& value, Tensor& output,
-                               const AttentionOptions& options, const attention_detail::DecodeConfig& decode_config,
-                               float scale, cudaStream_t stream)
+Status launch_paged_decode_typed(Tensor& query, Tensor& key, Tensor& value, Tensor& output,
+                                 const AttentionOptions& options,
+                                 const attention_detail::DecodeConfig& decode_config, float scale,
+                                 cudaStream_t stream)
 {
-    launch_paged_decode_split<Scalar>(query, key, value, output, options.block_table, options.kv_head_count,
-                                      options.max_context_blocks, options.context_lengths, query.shape()[0],
-                                      query.shape()[2], query.shape()[3], scale, options.max_decode_context_length,
-                                      decode_config.split_size, stream);
+    return launch_paged_decode_split<Scalar>(query, key, value, output, options.block_table, options.kv_head_count,
+                                             options.max_context_blocks, options.context_lengths, query.shape()[0],
+                                             query.shape()[2], query.shape()[3], scale,
+                                             options.max_decode_context_length, decode_config.split_size, stream);
 }
 }  // namespace
 
-void attention_detail::launch_paged_decode(Tensor& query, Tensor& key, Tensor& value, Tensor& output,
-                                           const AttentionOptions& options, const DecodeConfig& decode_config,
-                                           float scale, const device::Context& context)
+Status attention_detail::launch_paged_decode(Tensor& query, Tensor& key, Tensor& value, Tensor& output,
+                                             const AttentionOptions& options, const DecodeConfig& decode_config,
+                                             float scale, const device::Context& context)
 {
     if (query.dtype() == DType::BF16)
     {
-        launch_paged_decode_typed<__nv_bfloat16>(query, key, value, output, options, decode_config, scale,
-                                                 context.stream());
+        return launch_paged_decode_typed<__nv_bfloat16>(query, key, value, output, options, decode_config, scale,
+                                                        context.stream());
     }
     else
     {
-        launch_paged_decode_typed<half>(query, key, value, output, options, decode_config, scale, context.stream());
+        return launch_paged_decode_typed<half>(query, key, value, output, options, decode_config, scale,
+                                               context.stream());
     }
 }
 }  // namespace firefly::kernels

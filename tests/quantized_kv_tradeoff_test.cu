@@ -11,12 +11,18 @@
 
 #include "firefly/kernels/attention/attention.h"
 #include "firefly/kernels/cache/kv_cache.h"
+#include "test_support.h"
 
 namespace
 {
 using firefly::Device;
 using firefly::DType;
 using firefly::Tensor;
+
+Tensor make_tensor(std::vector<int64_t> shape, DType dtype)
+{
+    return firefly::test::require_tensor(Tensor::create(std::move(shape), dtype, Device::CUDA));
+}
 
 constexpr int page_size = 16;
 constexpr int query_heads = 16;
@@ -77,18 +83,18 @@ bool run_case(int batch_size, int context_length)
     int blocks_per_sequence = (token_count + page_size - 1) / page_size;
     int total_blocks = batch_size * blocks_per_sequence;
 
-    Tensor query({batch_size, 1, query_heads, head_dim}, DType::BF16, Device::CUDA);
-    Tensor key({batch_size, token_count, kv_heads, head_dim}, DType::BF16, Device::CUDA);
-    Tensor value({batch_size, token_count, kv_heads, head_dim}, DType::BF16, Device::CUDA);
-    Tensor bf16_key_cache({total_blocks, page_size, kv_heads, head_dim}, DType::BF16, Device::CUDA);
-    Tensor bf16_value_cache({total_blocks, page_size, kv_heads, head_dim}, DType::BF16, Device::CUDA);
-    Tensor int8_key_cache({total_blocks, page_size, kv_heads, head_dim}, DType::I8, Device::CUDA);
-    Tensor int8_value_cache({total_blocks, page_size, kv_heads, head_dim}, DType::I8, Device::CUDA);
-    Tensor scale_cache({total_blocks, kv_heads, page_size, 2}, DType::F32, Device::CUDA);
-    Tensor bf16_output({batch_size, 1, query_heads, head_dim}, DType::BF16, Device::CUDA);
-    Tensor int8_output({batch_size, 1, query_heads, head_dim}, DType::BF16, Device::CUDA);
-    Tensor context_lengths_device({batch_size}, DType::I32, Device::CUDA);
-    Tensor block_table_device({batch_size * blocks_per_sequence}, DType::I32, Device::CUDA);
+    Tensor query = make_tensor({batch_size, 1, query_heads, head_dim}, DType::BF16);
+    Tensor key = make_tensor({batch_size, token_count, kv_heads, head_dim}, DType::BF16);
+    Tensor value = make_tensor({batch_size, token_count, kv_heads, head_dim}, DType::BF16);
+    Tensor bf16_key_cache = make_tensor({total_blocks, page_size, kv_heads, head_dim}, DType::BF16);
+    Tensor bf16_value_cache = make_tensor({total_blocks, page_size, kv_heads, head_dim}, DType::BF16);
+    Tensor int8_key_cache = make_tensor({total_blocks, page_size, kv_heads, head_dim}, DType::I8);
+    Tensor int8_value_cache = make_tensor({total_blocks, page_size, kv_heads, head_dim}, DType::I8);
+    Tensor scale_cache = make_tensor({total_blocks, kv_heads, page_size, 2}, DType::F32);
+    Tensor bf16_output = make_tensor({batch_size, 1, query_heads, head_dim}, DType::BF16);
+    Tensor int8_output = make_tensor({batch_size, 1, query_heads, head_dim}, DType::BF16);
+    Tensor context_lengths_device = make_tensor({batch_size}, DType::I32);
+    Tensor block_table_device = make_tensor({batch_size * blocks_per_sequence}, DType::I32);
 
     int threads = 256;
     fill_bf16<<<(query.numel() + threads - 1) / threads, threads>>>(

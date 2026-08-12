@@ -8,12 +8,18 @@
 #include <vector>
 
 #include "firefly/kernels/attention/attention.h"
+#include "test_support.h"
 
 namespace
 {
 using firefly::Device;
 using firefly::DType;
 using firefly::Tensor;
+
+Tensor make_tensor(std::vector<int64_t> shape, DType dtype)
+{
+    return firefly::test::require_tensor(Tensor::create(std::move(shape), dtype, Device::CUDA));
+}
 
 __global__ void fill_bf16(__nv_bfloat16* data, int64_t count, uint32_t seed, float scale)
 {
@@ -62,13 +68,13 @@ bool run_case(int batch_size, int context_len, int num_heads = 16, int kv_heads 
     int           max_blocks = pages + 2;
     int           total_blocks = batch_size * max_blocks;
 
-    Tensor q({batch_size, 1, num_heads, head_dim}, DType::BF16, Device::CUDA);
-    Tensor k_cache({total_blocks, page_size, kv_heads, head_dim}, DType::BF16, Device::CUDA);
-    Tensor v_cache({total_blocks, page_size, kv_heads, head_dim}, DType::BF16, Device::CUDA);
-    Tensor reference({batch_size, 1, num_heads, head_dim}, DType::BF16, Device::CUDA);
-    Tensor candidate({batch_size, 1, num_heads, head_dim}, DType::BF16, Device::CUDA);
-    Tensor context_device({batch_size}, DType::I32, Device::CUDA);
-    Tensor blocks_device({batch_size * max_blocks}, DType::I32, Device::CUDA);
+    Tensor q = make_tensor({batch_size, 1, num_heads, head_dim}, DType::BF16);
+    Tensor k_cache = make_tensor({total_blocks, page_size, kv_heads, head_dim}, DType::BF16);
+    Tensor v_cache = make_tensor({total_blocks, page_size, kv_heads, head_dim}, DType::BF16);
+    Tensor reference = make_tensor({batch_size, 1, num_heads, head_dim}, DType::BF16);
+    Tensor candidate = make_tensor({batch_size, 1, num_heads, head_dim}, DType::BF16);
+    Tensor context_device = make_tensor({batch_size}, DType::I32);
+    Tensor blocks_device = make_tensor({batch_size * max_blocks}, DType::I32);
 
     int threads = 256;
     fill_bf16<<<(q.numel() + threads - 1) / threads, threads>>>(static_cast<__nv_bfloat16*>(q.data()), q.numel(),
@@ -142,13 +148,13 @@ bool run_prefill_case(int batch_size, int context_len, int seq_len)
     int           max_blocks = pages + 2;
     int           total_blocks = batch_size * max_blocks;
 
-    Tensor q({batch_size, seq_len, num_heads, head_dim}, DType::BF16, Device::CUDA);
-    Tensor k_cache({total_blocks, page_size, kv_heads, head_dim}, DType::BF16, Device::CUDA);
-    Tensor v_cache({total_blocks, page_size, kv_heads, head_dim}, DType::BF16, Device::CUDA);
-    Tensor reference({batch_size, seq_len, num_heads, head_dim}, DType::BF16, Device::CUDA);
-    Tensor candidate({batch_size, seq_len, num_heads, head_dim}, DType::BF16, Device::CUDA);
-    Tensor context_device({batch_size}, DType::I32, Device::CUDA);
-    Tensor blocks_device({batch_size * max_blocks}, DType::I32, Device::CUDA);
+    Tensor q = make_tensor({batch_size, seq_len, num_heads, head_dim}, DType::BF16);
+    Tensor k_cache = make_tensor({total_blocks, page_size, kv_heads, head_dim}, DType::BF16);
+    Tensor v_cache = make_tensor({total_blocks, page_size, kv_heads, head_dim}, DType::BF16);
+    Tensor reference = make_tensor({batch_size, seq_len, num_heads, head_dim}, DType::BF16);
+    Tensor candidate = make_tensor({batch_size, seq_len, num_heads, head_dim}, DType::BF16);
+    Tensor context_device = make_tensor({batch_size}, DType::I32);
+    Tensor blocks_device = make_tensor({batch_size * max_blocks}, DType::I32);
 
     int threads = 256;
     fill_bf16<<<(q.numel() + threads - 1) / threads, threads>>>(static_cast<__nv_bfloat16*>(q.data()), q.numel(),
@@ -210,11 +216,11 @@ bool run_contiguous_prefill_case(int batch_size, int seq_len)
     constexpr int num_heads = 16;
     constexpr int kv_heads = 8;
     constexpr int head_dim = 128;
-    Tensor        q({batch_size, seq_len, num_heads, head_dim}, DType::BF16, Device::CUDA);
-    Tensor        k({batch_size, seq_len, kv_heads, head_dim}, DType::BF16, Device::CUDA);
-    Tensor        v({batch_size, seq_len, kv_heads, head_dim}, DType::BF16, Device::CUDA);
-    Tensor        reference({batch_size, seq_len, num_heads, head_dim}, DType::BF16, Device::CUDA);
-    Tensor        candidate({batch_size, seq_len, num_heads, head_dim}, DType::BF16, Device::CUDA);
+    Tensor q = make_tensor({batch_size, seq_len, num_heads, head_dim}, DType::BF16);
+    Tensor k = make_tensor({batch_size, seq_len, kv_heads, head_dim}, DType::BF16);
+    Tensor v = make_tensor({batch_size, seq_len, kv_heads, head_dim}, DType::BF16);
+    Tensor reference = make_tensor({batch_size, seq_len, num_heads, head_dim}, DType::BF16);
+    Tensor candidate = make_tensor({batch_size, seq_len, num_heads, head_dim}, DType::BF16);
 
     int threads = 256;
     fill_bf16<<<(q.numel() + threads - 1) / threads, threads>>>(static_cast<__nv_bfloat16*>(q.data()), q.numel(),
@@ -265,14 +271,14 @@ bool run_quantized_prefill_case(int batch_size, int context_len, int seq_len)
     int           max_blocks = pages + 2;
     int           total_blocks = batch_size * max_blocks;
 
-    Tensor q({batch_size, seq_len, num_heads, head_dim}, DType::BF16, Device::CUDA);
-    Tensor k_cache({total_blocks, page_size, kv_heads, head_dim}, DType::I8, Device::CUDA);
-    Tensor v_cache({total_blocks, page_size, kv_heads, head_dim}, DType::I8, Device::CUDA);
-    Tensor scales({total_blocks, kv_heads, page_size, 2}, DType::F32, Device::CUDA);
-    Tensor reference({batch_size, seq_len, num_heads, head_dim}, DType::BF16, Device::CUDA);
-    Tensor candidate({batch_size, seq_len, num_heads, head_dim}, DType::BF16, Device::CUDA);
-    Tensor context_device({batch_size}, DType::I32, Device::CUDA);
-    Tensor blocks_device({batch_size * max_blocks}, DType::I32, Device::CUDA);
+    Tensor q = make_tensor({batch_size, seq_len, num_heads, head_dim}, DType::BF16);
+    Tensor k_cache = make_tensor({total_blocks, page_size, kv_heads, head_dim}, DType::I8);
+    Tensor v_cache = make_tensor({total_blocks, page_size, kv_heads, head_dim}, DType::I8);
+    Tensor scales = make_tensor({total_blocks, kv_heads, page_size, 2}, DType::F32);
+    Tensor reference = make_tensor({batch_size, seq_len, num_heads, head_dim}, DType::BF16);
+    Tensor candidate = make_tensor({batch_size, seq_len, num_heads, head_dim}, DType::BF16);
+    Tensor context_device = make_tensor({batch_size}, DType::I32);
+    Tensor blocks_device = make_tensor({batch_size * max_blocks}, DType::I32);
 
     int threads = 256;
     fill_bf16<<<(q.numel() + threads - 1) / threads, threads>>>(static_cast<__nv_bfloat16*>(q.data()), q.numel(),

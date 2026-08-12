@@ -9,6 +9,7 @@
 #include "firefly/core/tensor.h"
 #include "firefly/device/context.h"
 #include "firefly/kernels/attention/attention.h"
+#include "test_support.h"
 
 using namespace firefly;
 
@@ -17,6 +18,11 @@ namespace
 using firefly::Device;
 using firefly::DType;
 using firefly::Tensor;
+
+Tensor make_tensor(std::vector<int64_t> shape, DType dtype)
+{
+    return firefly::test::require_tensor(Tensor::create(std::move(shape), dtype, Device::CUDA));
+}
 
 float random_value(uint32_t& state)
 {
@@ -51,16 +57,16 @@ int main()
     constexpr int context_len = 0;
     constexpr int page_size = 16;
 
-    Tensor q({1, seq_len, query_heads, head_dim}, DType::BF16, Device::CUDA);
-    Tensor k_cache({max_blocks, page_size, kv_heads, head_dim}, DType::BF16, Device::CUDA);
-    Tensor v_cache({max_blocks, page_size, kv_heads, head_dim}, DType::BF16, Device::CUDA);
-    Tensor out_row({1, seq_len, query_heads * head_dim}, DType::BF16, Device::CUDA);
-    Tensor out_batch({2, seq_len, query_heads * head_dim}, DType::BF16, Device::CUDA);
-    Tensor q_batch({2, seq_len, query_heads, head_dim}, DType::BF16, Device::CUDA);
-    Tensor block_table_row({max_blocks}, DType::I32, Device::CUDA);
-    Tensor block_table_batch({2 * max_blocks}, DType::I32, Device::CUDA);
-    Tensor context_lens_row({1}, DType::I32, Device::CUDA);
-    Tensor context_lens_batch({2}, DType::I32, Device::CUDA);
+    Tensor q = make_tensor({1, seq_len, query_heads, head_dim}, DType::BF16);
+    Tensor k_cache = make_tensor({max_blocks, page_size, kv_heads, head_dim}, DType::BF16);
+    Tensor v_cache = make_tensor({max_blocks, page_size, kv_heads, head_dim}, DType::BF16);
+    Tensor out_row = make_tensor({1, seq_len, query_heads * head_dim}, DType::BF16);
+    Tensor out_batch = make_tensor({2, seq_len, query_heads * head_dim}, DType::BF16);
+    Tensor q_batch = make_tensor({2, seq_len, query_heads, head_dim}, DType::BF16);
+    Tensor block_table_row = make_tensor({max_blocks}, DType::I32);
+    Tensor block_table_batch = make_tensor({2 * max_blocks}, DType::I32);
+    Tensor context_lens_row = make_tensor({1}, DType::I32);
+    Tensor context_lens_batch = make_tensor({2}, DType::I32);
 
     fill_bf16(q, 0x1234U);
     fill_bf16(k_cache, 0x5678U);

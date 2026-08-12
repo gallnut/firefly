@@ -7,6 +7,7 @@
 #include <iostream>
 #include <sstream>
 
+#include "firefly/device/error.h"
 #include "firefly/kernels/detail/cuda_scalar.cuh"
 #include "firefly/kernels/transformer/linear.h"
 
@@ -87,16 +88,6 @@ struct CublasState
     cublasHandle_t handle = nullptr;
     cudaStream_t stream = nullptr;
 
-    CublasState()
-    {
-        cublasStatus_t status = cublasCreate(&handle);
-        if (status != CUBLAS_STATUS_SUCCESS)
-        {
-            throw std::runtime_error(std::string("cublasCreate failed: ") + cublas_status_string(status));
-        }
-        cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH);
-    }
-
     ~CublasState()
     {
         if (handle) cublasDestroy(handle);
@@ -104,10 +95,25 @@ struct CublasState
 };
 
 
-CublasState& get_cublas_state()
+Result<CublasState*> get_cublas_state()
 {
     static thread_local CublasState state;
-    return state;
+    if (state.handle) return &state;
+    const cublasStatus_t create_status = cublasCreate(&state.handle);
+    if (create_status != CUBLAS_STATUS_SUCCESS)
+        return unexpected(Error{ErrorCode::Cublas,
+                                "cublasCreate failed: " + std::string(cublas_status_string(create_status)),
+                                static_cast<int>(create_status)});
+    const cublasStatus_t math_status = cublasSetMathMode(state.handle, CUBLAS_TENSOR_OP_MATH);
+    if (math_status != CUBLAS_STATUS_SUCCESS)
+    {
+        cublasDestroy(state.handle);
+        state.handle = nullptr;
+        return unexpected(Error{ErrorCode::Cublas,
+                                "cublasSetMathMode failed: " + std::string(cublas_status_string(math_status)),
+                                static_cast<int>(math_status)});
+    }
+    return &state;
 }
 
 cudaDataType_t cuda_data_type(DType dtype)
@@ -133,16 +139,17 @@ std::string shape_string(const Tensor& tensor)
 
 }  // namespace
 
-void matmul(const Tensor& input, const Tensor& weight, Tensor& output, const device::Context& context)
+Status matmul(const Tensor& input, const Tensor& weight, Tensor& output, const device::Context& context)
 {
-    require_float16_or_bfloat16(input.dtype(), "matmul");
-    require_same_dtype(input.dtype(), weight.dtype(), "matmul");
-    require_same_dtype(input.dtype(), output.dtype(), "matmul");
+    FIREFLY_TRY(require_float16_or_bfloat16(input.dtype(), "matmul"));
+    FIREFLY_TRY(require_same_dtype(input.dtype(), weight.dtype(), "matmul"));
+    FIREFLY_TRY(require_same_dtype(input.dtype(), output.dtype(), "matmul"));
 
     if (input.shape().empty() || weight.shape().size() != 2)
     {
-        throw std::runtime_error("matmul expects non-empty input and rank-2 weight, got input " + shape_string(input) +
-                                 " weight " + shape_string(weight));
+        return unexpected(Error{ErrorCode::InvalidArgument,
+                                "matmul expects non-empty input and rank-2 weight, got input " +
+                                    shape_string(input) + " weight " + shape_string(weight)});
     }
 
     // A: input [M, K]
@@ -169,14 +176,16 @@ void matmul(const Tensor& input, const Tensor& weight, Tensor& output, const dev
     }
     else
     {
-        throw std::runtime_error("matmul dimension mismatch: input " + shape_string(input) + " weight " +
-                                 shape_string(weight));
+        return unexpected(Error{ErrorCode::InvalidArgument,
+                                "matmul dimension mismatch: input " + shape_string(input) + " weight " +
+                                    shape_string(weight)});
     }
 
     if (output.numel() != static_cast<int64_t>(M) * N_out)
     {
-        throw std::runtime_error("matmul output shape mismatch: input " + shape_string(input) + " weight " +
-                                 shape_string(weight) + " output " + shape_string(output));
+        return unexpected(Error{ErrorCode::InvalidArgument,
+                                "matmul output shape mismatch: input " + shape_string(input) + " weight " +
+                                    shape_string(weight) + " output " + shape_string(output)});
     }
 
     if (M == 1 && K % 256 == 0 && K <= 32768 && weight.strides().size() == 2 && weight.strides()[1] == 1 &&
@@ -200,16 +209,20 @@ void matmul(const Tensor& input, const Tensor& weight, Tensor& output, const dev
                 static_cast<half*>(output.data()), N_out, K);
         }
         const cudaError_t error = cudaGetLastError();
-        if (error != cudaSuccess)
-            throw std::runtime_error(std::string("GEMV launch failed: ") + cudaGetErrorString(error));
-        return;
+        if (error != cudaSuccess) return unexpected(device::cuda_error(error, "launch GEMV kernel"));
+        return {};
     }
 
-    CublasState& state = get_cublas_state();
-    if (state.stream != context.stream())
+    CublasState* state = FIREFLY_TRY(get_cublas_state());
+    if (state->stream != context.stream())
     {
-        cublasSetStream(state.handle, context.stream());
-        state.stream = context.stream();
+        const cublasStatus_t stream_status = cublasSetStream(state->handle, context.stream());
+        if (stream_status != CUBLAS_STATUS_SUCCESS)
+            return unexpected(Error{ErrorCode::Cublas,
+                                    "cublasSetStream failed: " +
+                                        std::string(cublas_status_string(stream_status)),
+                                    static_cast<int>(stream_status)});
+        state->stream = context.stream();
     }
 
     float          alpha = 1.0f;
@@ -223,15 +236,19 @@ void matmul(const Tensor& input, const Tensor& weight, Tensor& output, const dev
     int               weight_ld = b_is_transposed ? K : N_out;
 
     cublasStatus_t status =
-        cublasGemmEx(state.handle, weight_op, CUBLAS_OP_N, N_out, M, K, &alpha, weight.data(), type, weight_ld,
+        cublasGemmEx(state->handle, weight_op, CUBLAS_OP_N, N_out, M, K, &alpha, weight.data(), type, weight_ld,
                      input.data(), type, K, &beta, output.data(), type, N_out, CUBLAS_COMPUTE_32F,
                      CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     if (status != CUBLAS_STATUS_SUCCESS)
     {
-        throw std::runtime_error("cuBLAS Gemm failed: " + std::string(cublas_status_string(status)) + " input " +
-                                 shape_string(input) + " weight " + shape_string(weight) + " output " +
-                                 shape_string(output) + " dtype " + std::string(dtype_to_string(input.dtype())));
+        return unexpected(Error{ErrorCode::Cublas,
+                                "cuBLAS Gemm failed: " + std::string(cublas_status_string(status)) +
+                                    " input " + shape_string(input) + " weight " + shape_string(weight) +
+                                    " output " + shape_string(output) + " dtype " +
+                                    std::string(dtype_to_string(input.dtype())),
+                                static_cast<int>(status)});
     }
+    return {};
 }
 
 }  // namespace firefly::kernels

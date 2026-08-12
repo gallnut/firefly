@@ -5,7 +5,6 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
-#include <stdexcept>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -31,6 +30,19 @@ Engine::Engine(model::Model* model, const model::ModelConfig& config, const mode
             std::min(options_.max_prefill_chunk_size, runtime_requirements_.prefill_chunk_limit);
 }
 
+Result<std::unique_ptr<Engine>> Engine::create(model::Model* model, const model::ModelConfig& config,
+                                               const model::Tokenizer& tokenizer, ResultQueue* result_queue,
+                                               EngineOptions options)
+{
+    if (model == nullptr)
+        return unexpected(Error{ErrorCode::InvalidArgument, "engine requires a loaded target model"});
+    auto engine = std::unique_ptr<Engine>(new Engine(model, config, tokenizer, result_queue, options));
+    if (options.speculative.proposer != nullptr)
+        engine->speculative_decoder_ = FIREFLY_TRY(SpeculativeDecoder::create(
+            model, config, engine->runtime_requirements_, options.speculative));
+    return engine;
+}
+
 Engine::~Engine() { stop(); }
 
 void Engine::async_generate(const std::string& id, const std::vector<int>& input_ids, int max_tokens,
@@ -41,11 +53,22 @@ void Engine::async_generate(const std::string& id, const std::vector<int>& input
     scheduler_.add_sequence(sequence);
 }
 
-void Engine::loop()
+void Engine::loop() noexcept
 {
-    cudaSetDevice(0);
+    if (const cudaError_t error = cudaSetDevice(0); error != cudaSuccess)
+    {
+        Error failure = device::cuda_error(error, "select engine CUDA device");
+        FIREFLY_LOG_ERROR("engine", "{}", failure.describe());
+        running_ = false;
+        return;
+    }
     auto stream_result = device::Stream::create();
-    if (!stream_result) throw std::runtime_error(stream_result.error().description());
+    if (!stream_result)
+    {
+        FIREFLY_LOG_ERROR("engine", "{}", stream_result.error().describe());
+        running_ = false;
+        return;
+    }
     device::Stream  stream_owner = std::move(stream_result.value());
     device::Context context = stream_owner.context();
     uint64_t         step_index = 0;
@@ -74,6 +97,7 @@ void Engine::loop()
 #endif
         for (const auto& request : batch.failed_sequences)
         {
+            if (speculative_decoder_ != nullptr) speculative_decoder_->erase(request->id);
             if (result_queue_)
             {
                 result_queue_->push(request->id,
@@ -94,6 +118,7 @@ void Engine::loop()
         {
             if (request->is_cancelled())
             {
+                if (speculative_decoder_ != nullptr) speculative_decoder_->erase(request->id);
                 scheduler_.abort_sequence(request);
                 if (result_queue_)
                 {
@@ -118,17 +143,18 @@ void Engine::loop()
         const bool mixed_batch = !runtime_requirements_.sequence_state &&
                                  std::getenv("FIREFLY_MIXED_BATCH") != nullptr;
         bool       decode_handled = false;
+        Status step_status;
         if (mixed_batch && !prefill_requests.empty())
         {
             FIREFLY_NVTX_PUSH("Engine_Mixed");
-            process_mixed_batch(batch.sequences, context);
+            step_status = process_mixed_batch(batch.sequences, context);
             FIREFLY_NVTX_POP();
             decode_handled = decode_requests.empty() == false;
         }
         else if (!prefill_requests.empty())
         {
             FIREFLY_NVTX_PUSH("Engine_Prefill");
-            process_prefill(prefill_requests, context);
+            step_status = process_prefill(prefill_requests, context);
             FIREFLY_NVTX_POP();
         }
 #ifdef FIREFLY_ENABLE_RUNTIME_PROFILING
@@ -138,8 +164,14 @@ void Engine::loop()
         if (!decode_handled && !decode_requests.empty())
         {
             FIREFLY_NVTX_PUSH("Engine_Decode");
-            process_decode(decode_requests, context);
+            step_status = process_decode(decode_requests, context);
             FIREFLY_NVTX_POP();
+        }
+        if (!step_status)
+        {
+            FIREFLY_LOG_ERROR("engine", "request batch failed error={}", step_status.error().describe());
+            fail_requests(batch.sequences, step_status.error());
+            continue;
         }
 #ifdef FIREFLY_ENABLE_RUNTIME_PROFILING
         auto decode_end = std::chrono::high_resolution_clock::now();
@@ -170,5 +202,19 @@ void Engine::loop()
 #endif
     }
 
+}
+
+void Engine::fail_requests(const std::vector<scheduler::SequencePtr>& requests, const Error& error)
+{
+    for (const auto& request : requests)
+    {
+        if (speculative_decoder_ != nullptr) speculative_decoder_->erase(request->id);
+        request->error_message = error.describe();
+        scheduler_.abort_sequence(request);
+        if (result_queue_)
+            result_queue_->push(request->id, request->error_message, true,
+                                static_cast<int>(request->prompt_tokens.size()),
+                                static_cast<int>(request->generated_tokens.size()));
+    }
 }
 }  // namespace firefly::execution

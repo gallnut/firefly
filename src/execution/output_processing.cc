@@ -13,21 +13,31 @@ void Engine::process_outputs(const std::vector<scheduler::SequencePtr>& sequence
     {
         if (request->generated_tokens.empty()) continue;
 
-        int next_token_id = request->generated_tokens.back();
-        FIREFLY_LOG_TRACE("generation", "request_id={} token_index={} token_id={}", request->id,
-                          request->generated_tokens.size() - 1, next_token_id);
-        std::string text = tokenizer_.decode(next_token_id);
-        bool hit_stop_token = !request->ignore_eos &&
-            (tokenizer_.has_token("<|im_end|>") && next_token_id == tokenizer_.token_id("<|im_end|>")) ||
-            (!request->ignore_eos && tokenizer_.has_token("<|endoftext|>") &&
-             next_token_id == tokenizer_.token_id("<|endoftext|>"));
-        bool is_finished = hit_stop_token || request->generated_tokens.size() >= static_cast<size_t>(request->max_tokens);
+        std::string pending_text;
+        bool        is_finished = false;
+        bool        hit_stop_token = false;
+        while (request->emitted_tokens < request->generated_tokens.size())
+        {
+            const size_t token_index = request->emitted_tokens++;
+            const int    next_token_id = request->generated_tokens[token_index];
+            FIREFLY_LOG_TRACE("generation", "request_id={} token_index={} token_id={}", request->id, token_index,
+                              next_token_id);
+            pending_text += tokenizer_.decode(next_token_id);
+            hit_stop_token = !request->ignore_eos &&
+                ((tokenizer_.has_token("<|im_end|>") && next_token_id == tokenizer_.token_id("<|im_end|>")) ||
+                 (tokenizer_.has_token("<|endoftext|>") && next_token_id == tokenizer_.token_id("<|endoftext|")));
+            if (hit_stop_token) request->generated_tokens.resize(token_index + 1);
+            is_finished = hit_stop_token ||
+                          (token_index + 1 == request->generated_tokens.size() &&
+                           request->generated_tokens.size() >= static_cast<size_t>(request->max_tokens));
+            if (is_finished) break;
+        }
+        if (request->emitted_tokens == 0) continue;
 
-        FIREFLY_LOG_DEBUG("generation", "request_id={} token_index={} token_id={} finished={} stop_token={}",
-                          request->id, request->generated_tokens.size() - 1, next_token_id, is_finished,
-                          hit_stop_token);
+        FIREFLY_LOG_DEBUG("generation", "request_id={} emitted={} generated={} finished={} stop_token={}", request->id,
+                          request->emitted_tokens, request->generated_tokens.size(), is_finished, hit_stop_token);
 
-        request->utf8_buffer += text;
+        request->utf8_buffer += pending_text;
         size_t valid_length = 0;
         size_t length = request->utf8_buffer.length();
         for (size_t width = 1; width <= std::min<size_t>(4, length); ++width)
@@ -71,7 +81,11 @@ void Engine::process_outputs(const std::vector<scheduler::SequencePtr>& sequence
                 result_queue_->push(request->id, valid_text, false);
         }
 
-        if (is_finished) scheduler_.finish_sequence(request);
+        if (is_finished)
+        {
+            if (speculative_decoder_ != nullptr) speculative_decoder_->erase(request->id);
+            scheduler_.finish_sequence(request);
+        }
     }
 }
 

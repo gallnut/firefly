@@ -3,6 +3,7 @@
 
 
 #include "firefly/core/logging.h"
+#include "firefly/device/error.h"
 #include "firefly/kernels/transformer/embedding.h"
 
 namespace firefly::kernels
@@ -38,9 +39,12 @@ __global__ void embedding_kernel_simple(const int* input_ids, const short* table
     }
 }
 
-void embedding_lookup(const Tensor& input_ids, const Tensor& embedding_table, Tensor& output,
-                      const device::Context& context)
+Status embedding_lookup(const Tensor& input_ids, const Tensor& embedding_table, Tensor& output,
+                        const device::Context& context)
 {
+    if (input_ids.dtype() != DType::I32 || input_ids.shape().size() != 2 || embedding_table.shape().size() != 2 ||
+        output.numel() != input_ids.numel() * embedding_table.shape()[1])
+        return unexpected(Error{ErrorCode::InvalidArgument, "embedding tensor shapes or dtypes are invalid"});
     // input_ids: [batch_size, seq_len]
     // embedding_table: [vocab_size, hidden_size]
     // output: [batch_size, seq_len, hidden_size]
@@ -60,11 +64,8 @@ void embedding_lookup(const Tensor& input_ids, const Tensor& embedding_table, Te
         hidden_size, vocab_size);
 
     cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess)
-    {
-        FIREFLY_LOG_ERROR("cuda", "kernel launch failed operation=embedding_lookup error={} code={}",
-                          cudaGetErrorString(err), static_cast<int>(err));
-    }
+    if (err != cudaSuccess) return unexpected(device::cuda_error(err, "launch embedding lookup kernel"));
+    return {};
 }
 
 }  // namespace firefly::kernels

@@ -2,9 +2,9 @@
 #include <cuda_runtime.h>
 
 #include <iostream>
-#include <stdexcept>
 #include <string>
 
+#include "firefly/device/error.h"
 #include "firefly/kernels/detail/cuda_scalar.cuh"
 #include "firefly/kernels/transformer/rope.h"
 
@@ -141,31 +141,32 @@ void dispatch_rope(Tensor& q, Tensor& k, int head_dim, int seq_len, float theta,
     }
 }
 
-void apply_rope(Tensor& q, Tensor& k, int head_dim, int seq_len, float theta, const int* context_lens,
-                const device::Context& context)
+Status apply_rope(Tensor& q, Tensor& k, int head_dim, int seq_len, float theta, const int* context_lens,
+                  const device::Context& context)
 {
-    require_float16_or_bfloat16(q.dtype(), "apply_rope");
-    require_same_dtype(q.dtype(), k.dtype(), "apply_rope");
+    FIREFLY_TRY(require_float16_or_bfloat16(q.dtype(), "apply_rope"));
+    FIREFLY_TRY(require_same_dtype(q.dtype(), k.dtype(), "apply_rope"));
 
     if (q.shape().size() != 4 || k.shape().size() != 4)
     {
-        throw std::runtime_error("RoPE expects rank-4 q/k tensors");
+        return unexpected(Error{ErrorCode::InvalidArgument, "RoPE expects rank-4 q/k tensors"});
     }
     if (seq_len <= 0)
     {
-        throw std::runtime_error("RoPE requires seq_len > 0");
+        return unexpected(Error{ErrorCode::InvalidArgument, "RoPE requires seq_len > 0"});
     }
     if (head_dim != q.shape()[3] || head_dim != k.shape()[3])
     {
-        throw std::runtime_error("RoPE head_dim does not match q/k tensor shapes");
+        return unexpected(Error{ErrorCode::InvalidArgument, "RoPE head_dim does not match q/k tensor shapes"});
     }
     if (q.shape()[0] != k.shape()[0] || q.shape()[1] != k.shape()[1])
     {
-        throw std::runtime_error("RoPE requires q/k to have the same batch and sequence dimensions");
+        return unexpected(Error{ErrorCode::InvalidArgument,
+                                "RoPE requires q/k to have the same batch and sequence dimensions"});
     }
     if (head_dim % 2 != 0)
     {
-        throw std::runtime_error("RoPE requires an even head_dim");
+        return unexpected(Error{ErrorCode::InvalidArgument, "RoPE requires an even head_dim"});
     }
 
     int num_heads_q = q.shape()[2];
@@ -185,32 +186,32 @@ void apply_rope(Tensor& q, Tensor& k, int head_dim, int seq_len, float theta, co
     }
 
     cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess)
-    {
-        throw std::runtime_error(std::string("CUDA Error in rope: ") + cudaGetErrorString(err));
-    }
+    if (err != cudaSuccess) return unexpected(device::cuda_error(err, "launch RoPE kernel"));
+    return {};
 }
 
-void apply_rope_positions(Tensor& q, Tensor& k, const Tensor& positions, float theta,
-                          const device::Context& context)
+Status apply_rope_positions(Tensor& q, Tensor& k, const Tensor& positions, float theta,
+                            const device::Context& context)
 {
-    require_float16_or_bfloat16(q.dtype(), "apply_rope_positions");
-    require_same_dtype(q.dtype(), k.dtype(), "apply_rope_positions");
+    FIREFLY_TRY(require_float16_or_bfloat16(q.dtype(), "apply_rope_positions"));
+    FIREFLY_TRY(require_same_dtype(q.dtype(), k.dtype(), "apply_rope_positions"));
     if (q.shape().size() != 4 || k.shape().size() != 4)
-        throw std::runtime_error("RoPE positions expects rank-4 q/k tensors");
+        return unexpected(Error{ErrorCode::InvalidArgument, "RoPE positions expects rank-4 q/k tensors"});
     if (positions.dtype() != DType::I32)
-        throw std::runtime_error("RoPE positions expects I32 positions");
+        return unexpected(Error{ErrorCode::InvalidArgument, "RoPE positions expects I32 positions"});
     if (q.shape()[0] != k.shape()[0] || q.shape()[1] != k.shape()[1])
-        throw std::runtime_error("RoPE positions requires q/k to have the same batch and sequence dimensions");
+        return unexpected(Error{ErrorCode::InvalidArgument,
+                                "RoPE positions requires q/k to have the same batch and sequence dimensions"});
     if (q.shape()[3] != k.shape()[3] || q.shape()[3] % 2 != 0)
-        throw std::runtime_error("RoPE positions requires matching even head_dim");
+        return unexpected(Error{ErrorCode::InvalidArgument,
+                                "RoPE positions requires matching even head_dim"});
 
     const int head_dim = q.shape()[3];
     const int num_heads_q = q.shape()[2];
     const int num_heads_k = k.shape()[2];
     const int total_tokens = static_cast<int>(q.numel() / (num_heads_q * head_dim));
     if (total_tokens != positions.numel())
-        throw std::runtime_error("RoPE positions token count mismatch");
+        return unexpected(Error{ErrorCode::InvalidArgument, "RoPE positions token count mismatch"});
 
     if (q.dtype() == DType::BF16)
     {
@@ -226,8 +227,8 @@ void apply_rope_positions(Tensor& q, Tensor& k, const Tensor& positions, float t
     }
 
     cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess)
-        throw std::runtime_error(std::string("CUDA Error in rope positions: ") + cudaGetErrorString(err));
+    if (err != cudaSuccess) return unexpected(device::cuda_error(err, "launch positioned RoPE kernel"));
+    return {};
 }
 
 }  // namespace firefly::kernels

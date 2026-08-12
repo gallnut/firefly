@@ -4,11 +4,11 @@
 #include <array>
 #include <cstdint>
 #include <iostream>
-#include <stdexcept>
 
 #include "firefly/core/tensor.h"
 #include "firefly/device/stream.h"
 #include "firefly/kernels/sampling/argmax.h"
+#include "test_support.h"
 
 namespace
 {
@@ -28,22 +28,22 @@ void require_cuda(cudaError_t error, const char* operation)
     }
 }
 
-firefly::device::Context make_context()
-{
-    auto stream_result = firefly::device::Stream::create();
-    if (!stream_result) throw std::runtime_error(stream_result.error().description());
-    firefly::device::Stream stream = std::move(stream_result.value());
-    return stream.context();
-}
 }  // namespace
 
 int main()
 {
-    try
+    auto stream_result = firefly::device::Stream::create();
+    if (!stream_result)
     {
-        firefly::device::Context context = make_context();
-        firefly::Tensor logits({1, 4}, firefly::DType::BF16, firefly::Device::CUDA, context);
-        firefly::Tensor output({1}, firefly::DType::I32, firefly::Device::CUDA, context);
+        std::cerr << stream_result.error().describe() << '\n';
+        return 1;
+    }
+    firefly::device::Stream stream = std::move(stream_result.value());
+    firefly::device::Context context = stream.context();
+    firefly::Tensor logits = firefly::test::require_tensor(
+        firefly::Tensor::create({1, 4}, firefly::DType::BF16, firefly::Device::CUDA, context));
+    firefly::Tensor output = firefly::test::require_tensor(
+        firefly::Tensor::create({1}, firefly::DType::I32, firefly::Device::CUDA, context));
 
         std::array<__nv_bfloat16, 4> initial = {
             __float2bfloat16(4.0f), __float2bfloat16(3.0f), __float2bfloat16(2.0f), __float2bfloat16(1.0f)};
@@ -56,7 +56,12 @@ int main()
         require_cuda(cudaMemcpyAsync(logits.data(), updated.data(), logits.nbytes(), cudaMemcpyHostToDevice,
                                      context.stream()),
                      "updated logits copy");
-        firefly::kernels::argmax(logits, output, context);
+        auto argmax_status = firefly::kernels::argmax(logits, output, context);
+        if (!argmax_status)
+        {
+            std::cerr << argmax_status.error().describe() << '\n';
+            return 1;
+        }
 
         int token = -1;
         require_cuda(cudaMemcpyAsync(&token, output.data(), sizeof(token), cudaMemcpyDeviceToHost, context.stream()),
@@ -67,11 +72,5 @@ int main()
             std::cerr << "Expected argmax token 3, got " << token << '\n';
             return 1;
         }
-        return 0;
-    }
-    catch (const std::exception& error)
-    {
-        std::cerr << error.what() << '\n';
-        return 1;
-    }
+    return 0;
 }

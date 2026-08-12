@@ -8,6 +8,9 @@ lib/
 
 qwen3/
 qwen35/
+qwen35_dspark/
+
+papers/
 
 **/__pycache__/
 **/.venv/

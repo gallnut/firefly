@@ -1,9 +1,9 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include <stdexcept>
 #include <string>
 
+#include "firefly/device/error.h"
 #include "firefly/kernels/detail/cuda_scalar.cuh"
 #include "firefly/kernels/transformer/qk_rms_norm_rope.h"
 
@@ -162,9 +162,9 @@ __global__ void qk_rms_norm_rope_kernel(scalar_t* __restrict__ q, scalar_t* __re
 }
 
 template <typename scalar_t, bool quantize_query>
-void launch_qk_rms_norm_rope(Tensor& q, Tensor& k, const Tensor& q_weight, const Tensor& k_weight,
-                             const Tensor& factors, int head_dim, int total_tokens, double epsilon,
-                             Tensor* quantized_q, Tensor* quantized_q_scales, cudaStream_t stream)
+Status launch_qk_rms_norm_rope(Tensor& q, Tensor& k, const Tensor& q_weight, const Tensor& k_weight,
+                               const Tensor& factors, int head_dim, int total_tokens, double epsilon,
+                               Tensor* quantized_q, Tensor* quantized_q_scales, cudaStream_t stream)
 {
     dim3 grid(total_tokens, q.shape()[2]);
     if (head_dim == 128)
@@ -179,45 +179,48 @@ void launch_qk_rms_norm_rope(Tensor& q, Tensor& k, const Tensor& q_weight, const
     }
     else
     {
-        throw std::runtime_error("qk_rms_norm_rope currently supports head_dim 128");
+        return unexpected(Error{ErrorCode::InvalidArgument,
+                                "qk_rms_norm_rope currently supports head_dim 128"});
     }
+    return {};
 }
 }  // namespace
 
-void prepare_rope_factors(Tensor& factors, int seq_len, int head_dim, float theta, const int* context_lens,
-                          const device::Context& context)
+Status prepare_rope_factors(Tensor& factors, int seq_len, int head_dim, float theta, const int* context_lens,
+                            const device::Context& context)
 {
     if (factors.dtype() != DType::F32 || factors.shape().size() != 3 || factors.shape()[1] != head_dim / 2 ||
         factors.shape()[2] != 2)
     {
-        throw std::runtime_error("RoPE factors must have shape [tokens, head_dim / 2, 2] and dtype F32");
+        return unexpected(Error{ErrorCode::InvalidArgument,
+                                "RoPE factors must have shape [tokens, head_dim / 2, 2] and dtype F32"});
     }
     if (seq_len <= 0 || head_dim <= 0 || head_dim % 2 != 0)
     {
-        throw std::runtime_error("prepare_rope_factors requires positive seq_len and even head_dim");
+        return unexpected(Error{ErrorCode::InvalidArgument,
+                                "prepare_rope_factors requires positive seq_len and even head_dim"});
     }
 
     int total_tokens = factors.shape()[0];
     prepare_rope_factors_kernel<<<total_tokens, head_dim / 2, 0, context.stream()>>>(
         static_cast<float2*>(factors.data()), seq_len, total_tokens, head_dim, theta, context_lens);
     cudaError_t error = cudaGetLastError();
-    if (error != cudaSuccess)
-    {
-        throw std::runtime_error(std::string("prepare_rope_factors failed: ") + cudaGetErrorString(error));
-    }
+    if (error != cudaSuccess) return unexpected(device::cuda_error(error, "prepare RoPE factors"));
+    return {};
 }
 
-void qk_rms_norm_rope(Tensor& q, Tensor& k, const Tensor& q_weight, const Tensor& k_weight,
-                      const Tensor& rope_factors, double epsilon, const device::Context& context)
+Status qk_rms_norm_rope(Tensor& q, Tensor& k, const Tensor& q_weight, const Tensor& k_weight,
+                        const Tensor& rope_factors, double epsilon, const device::Context& context)
 {
-    require_float16_or_bfloat16(q.dtype(), "qk_rms_norm_rope");
-    require_same_dtype(q.dtype(), k.dtype(), "qk_rms_norm_rope");
-    require_same_dtype(q.dtype(), q_weight.dtype(), "qk_rms_norm_rope");
-    require_same_dtype(q.dtype(), k_weight.dtype(), "qk_rms_norm_rope");
+    FIREFLY_TRY(require_float16_or_bfloat16(q.dtype(), "qk_rms_norm_rope"));
+    FIREFLY_TRY(require_same_dtype(q.dtype(), k.dtype(), "qk_rms_norm_rope"));
+    FIREFLY_TRY(require_same_dtype(q.dtype(), q_weight.dtype(), "qk_rms_norm_rope"));
+    FIREFLY_TRY(require_same_dtype(q.dtype(), k_weight.dtype(), "qk_rms_norm_rope"));
     if (q.shape().size() != 4 || k.shape().size() != 4 || q.shape()[0] != k.shape()[0] ||
         q.shape()[1] != k.shape()[1] || q.shape()[3] != k.shape()[3])
     {
-        throw std::runtime_error("qk_rms_norm_rope requires compatible rank-4 q/k tensors");
+        return unexpected(Error{ErrorCode::InvalidArgument,
+                                "qk_rms_norm_rope requires compatible rank-4 q/k tensors"});
     }
     int head_dim = q.shape()[3];
     int total_tokens = q.shape()[0] * q.shape()[1];
@@ -225,64 +228,67 @@ void qk_rms_norm_rope(Tensor& q, Tensor& k, const Tensor& q_weight, const Tensor
         rope_factors.shape().size() != 3 || rope_factors.shape()[0] != total_tokens ||
         rope_factors.shape()[1] != head_dim / 2 || rope_factors.shape()[2] != 2)
     {
-        throw std::runtime_error("qk_rms_norm_rope tensor dimensions do not match");
+        return unexpected(Error{ErrorCode::InvalidArgument,
+                                "qk_rms_norm_rope tensor dimensions do not match"});
     }
 
     if (q.dtype() == DType::BF16)
     {
-        launch_qk_rms_norm_rope<__nv_bfloat16, false>(q, k, q_weight, k_weight, rope_factors, head_dim,
-                                                      total_tokens, epsilon, nullptr, nullptr, context.stream());
+        FIREFLY_TRY((launch_qk_rms_norm_rope<__nv_bfloat16, false>(q, k, q_weight, k_weight, rope_factors,
+                                                                   head_dim, total_tokens, epsilon, nullptr,
+                                                                   nullptr, context.stream())));
     }
     else
     {
-        launch_qk_rms_norm_rope<half, false>(q, k, q_weight, k_weight, rope_factors, head_dim, total_tokens,
-                                             epsilon, nullptr, nullptr, context.stream());
+        FIREFLY_TRY((launch_qk_rms_norm_rope<half, false>(q, k, q_weight, k_weight, rope_factors, head_dim,
+                                                          total_tokens, epsilon, nullptr, nullptr,
+                                                          context.stream())));
     }
     cudaError_t error = cudaGetLastError();
-    if (error != cudaSuccess)
-    {
-        throw std::runtime_error(std::string("qk_rms_norm_rope failed: ") + cudaGetErrorString(error));
-    }
+    if (error != cudaSuccess) return unexpected(device::cuda_error(error, "launch fused QK RMSNorm RoPE kernel"));
+    return {};
 }
 
-void qk_rms_norm_rope_quantized(Tensor& q, Tensor& k, const Tensor& q_weight, const Tensor& k_weight,
-                                const Tensor& rope_factors, Tensor& quantized_q, Tensor& quantized_q_scales,
-                                double epsilon, const device::Context& context)
+Status qk_rms_norm_rope_quantized(Tensor& q, Tensor& k, const Tensor& q_weight, const Tensor& k_weight,
+                                  const Tensor& rope_factors, Tensor& quantized_q, Tensor& quantized_q_scales,
+                                  double epsilon, const device::Context& context)
 {
-    require_float16_or_bfloat16(q.dtype(), "qk_rms_norm_rope_quantized");
-    require_same_dtype(q.dtype(), k.dtype(), "qk_rms_norm_rope_quantized");
-    require_same_dtype(q.dtype(), q_weight.dtype(), "qk_rms_norm_rope_quantized");
-    require_same_dtype(q.dtype(), k_weight.dtype(), "qk_rms_norm_rope_quantized");
+    FIREFLY_TRY(require_float16_or_bfloat16(q.dtype(), "qk_rms_norm_rope_quantized"));
+    FIREFLY_TRY(require_same_dtype(q.dtype(), k.dtype(), "qk_rms_norm_rope_quantized"));
+    FIREFLY_TRY(require_same_dtype(q.dtype(), q_weight.dtype(), "qk_rms_norm_rope_quantized"));
+    FIREFLY_TRY(require_same_dtype(q.dtype(), k_weight.dtype(), "qk_rms_norm_rope_quantized"));
     if (q.shape().size() != 4 || k.shape().size() != 4 || q.shape()[0] != k.shape()[0] ||
         q.shape()[1] != k.shape()[1] || q.shape()[3] != 128 || k.shape()[3] != 128 ||
         quantized_q.dtype() != DType::I8 || quantized_q.numel() != q.numel() ||
         quantized_q_scales.dtype() != DType::F32 ||
         quantized_q_scales.numel() != q.shape()[0] * q.shape()[1] * q.shape()[2])
     {
-        throw std::runtime_error("qk_rms_norm_rope_quantized tensor dimensions do not match");
+        return unexpected(Error{ErrorCode::InvalidArgument,
+                                "qk_rms_norm_rope_quantized tensor dimensions do not match"});
     }
     int total_tokens = q.shape()[0] * q.shape()[1];
     if (q_weight.numel() != 128 || k_weight.numel() != 128 || rope_factors.shape().size() != 3 ||
         rope_factors.shape()[0] != total_tokens || rope_factors.shape()[1] != 64 || rope_factors.shape()[2] != 2)
     {
-        throw std::runtime_error("qk_rms_norm_rope_quantized tensor dimensions do not match");
+        return unexpected(Error{ErrorCode::InvalidArgument,
+                                "qk_rms_norm_rope_quantized tensor dimensions do not match"});
     }
 
     if (q.dtype() == DType::BF16)
     {
-        launch_qk_rms_norm_rope<__nv_bfloat16, true>(q, k, q_weight, k_weight, rope_factors, 128,
-                                                     total_tokens, epsilon, &quantized_q,
-                                                     &quantized_q_scales, context.stream());
+        FIREFLY_TRY((launch_qk_rms_norm_rope<__nv_bfloat16, true>(q, k, q_weight, k_weight, rope_factors, 128,
+                                                                  total_tokens, epsilon, &quantized_q,
+                                                                  &quantized_q_scales, context.stream())));
     }
     else
     {
-        launch_qk_rms_norm_rope<half, true>(q, k, q_weight, k_weight, rope_factors, 128, total_tokens,
-                                            epsilon, &quantized_q, &quantized_q_scales, context.stream());
+        FIREFLY_TRY((launch_qk_rms_norm_rope<half, true>(q, k, q_weight, k_weight, rope_factors, 128,
+                                                         total_tokens, epsilon, &quantized_q,
+                                                         &quantized_q_scales, context.stream())));
     }
     cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess)
-    {
-        throw std::runtime_error(std::string("qk_rms_norm_rope_quantized failed: ") + cudaGetErrorString(error));
-    }
+        return unexpected(device::cuda_error(error, "launch quantized fused QK RMSNorm RoPE kernel"));
+    return {};
 }
 }  // namespace firefly::kernels

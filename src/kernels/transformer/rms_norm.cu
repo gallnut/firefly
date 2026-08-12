@@ -1,9 +1,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include <stdexcept>
-
 #include "firefly/core/logging.h"
+#include "firefly/device/error.h"
 #include "firefly/kernels/detail/cuda_scalar.cuh"
 #include "firefly/kernels/transformer/rms_norm.h"
 
@@ -281,12 +280,15 @@ void dispatch_rms_norm(const Tensor& input, const Tensor& weight, Tensor& output
 #undef LAUNCH_RMS_NORM_OPTIMIZED
 }
 
-void rms_norm(const Tensor& input, const Tensor& weight, Tensor& output, double epsilon,
-              const device::Context& context)
+Status rms_norm(const Tensor& input, const Tensor& weight, Tensor& output, double epsilon,
+                const device::Context& context)
 {
-    require_float16_or_bfloat16(input.dtype(), "rms_norm");
-    require_same_dtype(input.dtype(), weight.dtype(), "rms_norm");
-    require_same_dtype(input.dtype(), output.dtype(), "rms_norm");
+    FIREFLY_TRY(require_float16_or_bfloat16(input.dtype(), "rms_norm"));
+    FIREFLY_TRY(require_same_dtype(input.dtype(), weight.dtype(), "rms_norm"));
+    FIREFLY_TRY(require_same_dtype(input.dtype(), output.dtype(), "rms_norm"));
+    if (input.shape().empty() || input.shape().back() <= 0 || input.numel() != output.numel() ||
+        weight.numel() != input.shape().back())
+        return unexpected(Error{ErrorCode::InvalidArgument, "rms_norm tensor shapes are incompatible"});
 
     const int hidden_size = input.shape().back();
     const int num_tokens = input.numel() / hidden_size;
@@ -303,11 +305,8 @@ void rms_norm(const Tensor& input, const Tensor& weight, Tensor& output, double 
     }
 
     cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess)
-    {
-        FIREFLY_LOG_ERROR("cuda", "kernel launch failed operation=rms_norm error={} code={}",
-                          cudaGetErrorString(err), static_cast<int>(err));
-    }
+    if (err != cudaSuccess) return unexpected(device::cuda_error(err, "launch rms_norm kernel"));
+    return {};
 }
 
 template <typename scalar_t>
@@ -347,15 +346,16 @@ void dispatch_add_rms_norm(Tensor& residual, const Tensor& input, const Tensor& 
             static_cast<float>(epsilon));
 }
 
-void add_rms_norm(Tensor& residual, const Tensor& input, const Tensor& weight, Tensor& output, double epsilon,
-                  const device::Context& context)
+Status add_rms_norm(Tensor& residual, const Tensor& input, const Tensor& weight, Tensor& output, double epsilon,
+                    const device::Context& context)
 {
-    require_float16_or_bfloat16(residual.dtype(), "add_rms_norm");
-    require_same_dtype(residual.dtype(), input.dtype(), "add_rms_norm");
-    require_same_dtype(residual.dtype(), weight.dtype(), "add_rms_norm");
-    require_same_dtype(residual.dtype(), output.dtype(), "add_rms_norm");
-    if (residual.numel() != input.numel() || residual.numel() != output.numel())
-        throw std::runtime_error("add_rms_norm tensor size mismatch");
+    FIREFLY_TRY(require_float16_or_bfloat16(residual.dtype(), "add_rms_norm"));
+    FIREFLY_TRY(require_same_dtype(residual.dtype(), input.dtype(), "add_rms_norm"));
+    FIREFLY_TRY(require_same_dtype(residual.dtype(), weight.dtype(), "add_rms_norm"));
+    FIREFLY_TRY(require_same_dtype(residual.dtype(), output.dtype(), "add_rms_norm"));
+    if (residual.shape().empty() || residual.shape().back() <= 0 || residual.numel() != input.numel() ||
+        residual.numel() != output.numel() || weight.numel() != residual.shape().back())
+        return unexpected(Error{ErrorCode::InvalidArgument, "add_rms_norm tensor shapes are incompatible"});
 
     const int hidden_size = residual.shape().back();
     const int num_tokens = residual.numel() / hidden_size;
@@ -367,11 +367,8 @@ void add_rms_norm(Tensor& residual, const Tensor& input, const Tensor& weight, T
                                     context.stream());
 
     cudaError_t error = cudaGetLastError();
-    if (error != cudaSuccess)
-    {
-        FIREFLY_LOG_ERROR("cuda", "kernel launch failed operation=add_rms_norm error={} code={}",
-                          cudaGetErrorString(error), static_cast<int>(error));
-    }
+    if (error != cudaSuccess) return unexpected(device::cuda_error(error, "launch add_rms_norm kernel"));
+    return {};
 }
 
 template <typename scalar_t, bool AddResidual>
@@ -418,12 +415,15 @@ void dispatch_zero_centered_rms_norm(Tensor& residual, const Tensor& input, cons
         static_cast<float>(epsilon));
 }
 
-void rms_norm_zero_centered(const Tensor& input, const Tensor& weight, Tensor& output, double epsilon,
-                            const device::Context& context)
+Status rms_norm_zero_centered(const Tensor& input, const Tensor& weight, Tensor& output, double epsilon,
+                              const device::Context& context)
 {
-    require_float16_or_bfloat16(input.dtype(), "rms_norm_zero_centered");
-    require_same_dtype(input.dtype(), weight.dtype(), "rms_norm_zero_centered");
-    require_same_dtype(input.dtype(), output.dtype(), "rms_norm_zero_centered");
+    FIREFLY_TRY(require_float16_or_bfloat16(input.dtype(), "rms_norm_zero_centered"));
+    FIREFLY_TRY(require_same_dtype(input.dtype(), weight.dtype(), "rms_norm_zero_centered"));
+    FIREFLY_TRY(require_same_dtype(input.dtype(), output.dtype(), "rms_norm_zero_centered"));
+    if (input.shape().empty() || input.shape().back() <= 0 || input.numel() != output.numel() ||
+        weight.numel() != input.shape().back())
+        return unexpected(Error{ErrorCode::InvalidArgument, "zero-centered rms_norm tensor shapes are incompatible"});
     const int row_size = input.shape().back();
     const int rows = input.numel() / row_size;
     Tensor empty;
@@ -435,16 +435,21 @@ void rms_norm_zero_centered(const Tensor& input, const Tensor& weight, Tensor& o
                                                      context.stream());
     const cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess)
-        throw std::runtime_error(std::string("rms_norm_zero_centered failed: ") + cudaGetErrorString(error));
+        return unexpected(device::cuda_error(error, "launch zero-centered rms_norm kernel"));
+    return {};
 }
 
-void add_rms_norm_zero_centered(Tensor& residual, const Tensor& input, const Tensor& weight, Tensor& output,
-                                double epsilon, const device::Context& context)
+Status add_rms_norm_zero_centered(Tensor& residual, const Tensor& input, const Tensor& weight, Tensor& output,
+                                  double epsilon, const device::Context& context)
 {
-    require_float16_or_bfloat16(residual.dtype(), "add_rms_norm_zero_centered");
-    require_same_dtype(residual.dtype(), input.dtype(), "add_rms_norm_zero_centered");
-    require_same_dtype(residual.dtype(), weight.dtype(), "add_rms_norm_zero_centered");
-    require_same_dtype(residual.dtype(), output.dtype(), "add_rms_norm_zero_centered");
+    FIREFLY_TRY(require_float16_or_bfloat16(residual.dtype(), "add_rms_norm_zero_centered"));
+    FIREFLY_TRY(require_same_dtype(residual.dtype(), input.dtype(), "add_rms_norm_zero_centered"));
+    FIREFLY_TRY(require_same_dtype(residual.dtype(), weight.dtype(), "add_rms_norm_zero_centered"));
+    FIREFLY_TRY(require_same_dtype(residual.dtype(), output.dtype(), "add_rms_norm_zero_centered"));
+    if (residual.shape().empty() || residual.shape().back() <= 0 || residual.numel() != input.numel() ||
+        residual.numel() != output.numel() || weight.numel() != residual.shape().back())
+        return unexpected(Error{ErrorCode::InvalidArgument,
+                                "zero-centered add_rms_norm tensor shapes are incompatible"});
     const int row_size = residual.shape().back();
     const int rows = residual.numel() / row_size;
     if (residual.dtype() == DType::BF16)
@@ -455,7 +460,8 @@ void add_rms_norm_zero_centered(Tensor& residual, const Tensor& input, const Ten
                                                     context.stream());
     const cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess)
-        throw std::runtime_error(std::string("add_rms_norm_zero_centered failed: ") + cudaGetErrorString(error));
+        return unexpected(device::cuda_error(error, "launch zero-centered add_rms_norm kernel"));
+    return {};
 }
 
 }  // namespace firefly::kernels

@@ -9,7 +9,6 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
-#include <stdexcept>
 #include <string_view>
 #include <vector>
 
@@ -21,6 +20,8 @@
 #include <flashinfer/attention/scheduler.cuh>
 #include <flashinfer/attention/variants.cuh>
 #include <flashinfer/page.cuh>
+
+#include "firefly/device/error.h"
 
 namespace firefly::kernels
 {
@@ -385,11 +386,11 @@ cudaError_t plan_flashinfer_decode(FlashInferDecodeState& state, const int* indp
 }
 }  // namespace
 
-void prepare_attention_decode(const int* context_lens, const int* block_table, int batch_size,
-                              int max_context_blocks, int num_qo_heads, int num_kv_heads, int head_dim,
-                              const device::Context& context)
+Status prepare_attention_decode(const int* context_lens, const int* block_table, int batch_size,
+                                int max_context_blocks, int num_qo_heads, int num_kv_heads, int head_dim,
+                                const device::Context& context)
 {
-    if ((head_dim != 128 && head_dim != 256) || num_kv_heads <= 0 || num_qo_heads % num_kv_heads != 0) return;
+    if ((head_dim != 128 && head_dim != 256) || num_kv_heads <= 0 || num_qo_heads % num_kv_heads != 0) return {};
     auto& state = decode_state();
     std::vector<int> indptr(batch_size + 1, 0);
     state.host_last_page_len.resize(batch_size);
@@ -409,23 +410,29 @@ void prepare_attention_decode(const int* context_lens, const int* block_table, i
 
     if (!state.float_workspace)
     {
-        cudaMalloc(&state.float_workspace, decode_float_workspace_bytes);
-        cudaMalloc(&state.int_workspace, int_workspace_bytes);
-        cudaMallocHost(&state.host_int_workspace, int_workspace_bytes);
+        FIREFLY_TRY(device::check_cuda(cudaMalloc(&state.float_workspace, decode_float_workspace_bytes),
+                                       "allocate FlashInfer decode float workspace"));
+        FIREFLY_TRY(device::check_cuda(cudaMalloc(&state.int_workspace, int_workspace_bytes),
+                                       "allocate FlashInfer decode integer workspace"));
+        FIREFLY_TRY(device::check_cuda(cudaMallocHost(&state.host_int_workspace, int_workspace_bytes),
+                                       "allocate FlashInfer decode host workspace"));
     }
     const size_t required_indices = indices.size();
     if (state.indices_capacity < required_indices)
     {
         if (state.indices) cudaFree(state.indices);
-        cudaMalloc(&state.indices, required_indices * sizeof(int));
+        FIREFLY_TRY(device::check_cuda(cudaMalloc(&state.indices, required_indices * sizeof(int)),
+                                       "allocate FlashInfer decode indices"));
         state.indices_capacity = required_indices;
     }
     if (state.batch_size != batch_size)
     {
         if (state.indptr) cudaFree(state.indptr);
         if (state.last_page_len) cudaFree(state.last_page_len);
-        cudaMalloc(&state.indptr, (batch_size + 1) * sizeof(int));
-        cudaMalloc(&state.last_page_len, batch_size * sizeof(int));
+        FIREFLY_TRY(device::check_cuda(cudaMalloc(&state.indptr, (batch_size + 1) * sizeof(int)),
+                                       "allocate FlashInfer decode indptr"));
+        FIREFLY_TRY(device::check_cuda(cudaMalloc(&state.last_page_len, batch_size * sizeof(int)),
+                                       "allocate FlashInfer decode page lengths"));
     }
 
     cudaStream_t stream = context.stream();
@@ -466,16 +473,17 @@ void prepare_attention_decode(const int* context_lens, const int* block_table, i
                                              : dispatch.template operator()<256>();
         if (status != cudaSuccess)
         {
-            throw std::runtime_error(std::string("FlashInfer decode planning failed: ") + cudaGetErrorString(status));
+            return unexpected(device::cuda_error(status, "plan FlashInfer decode"));
         }
         state.host_indptr = std::move(indptr);
     }
+    return {};
 }
 
 
-bool attention_backend::launch_flashinfer_decode(Tensor& q, Tensor& k_cache, Tensor& v_cache, Tensor& output,
-                                                 int kv_head_num, int head_dim, float scale,
-                                                 const device::Context& context)
+Result<bool> attention_backend::launch_flashinfer_decode(Tensor& q, Tensor& k_cache, Tensor& v_cache,
+                                                         Tensor& output, int kv_head_num, int head_dim, float scale,
+                                                         const device::Context& context)
 {
     if (q.dtype() == DType::BF16)
         return head_dim == 128
@@ -495,9 +503,9 @@ bool attention_backend::launch_flashinfer_decode(Tensor& q, Tensor& k_cache, Ten
     return false;
 }
 
-bool attention_backend::launch_flashinfer_contiguous_prefill(Tensor& q, Tensor& k, Tensor& v, Tensor& output,
-                                                             int kv_head_num, float scale,
-                                                             const device::Context& context)
+Result<bool> attention_backend::launch_flashinfer_contiguous_prefill(Tensor& q, Tensor& k, Tensor& v,
+                                                                     Tensor& output, int kv_head_num, float scale,
+                                                                     const device::Context& context)
 {
     const int head_dim = q.shape()[3];
     if ((head_dim != 128 && head_dim != 256) || q.shape()[1] <= 1 || k.shape()[1] != q.shape()[1]) return false;
@@ -553,7 +561,7 @@ bool launch_quantized_prefill(Tensor& q, Tensor& k_cache, Tensor& v_cache, Tenso
                                                     total_len, scale, stream);
 }
 
-bool attention_backend::launch_flashinfer_quantized_prefill(
+Result<bool> attention_backend::launch_flashinfer_quantized_prefill(
     Tensor& q, Tensor& k_cache, Tensor& v_cache, Tensor& scales, const int* block_table, Tensor& output,
     int kv_head_num, int max_context_blocks, int context_length, float scale, const device::Context& context)
 {
@@ -631,14 +639,14 @@ bool dispatch_flashinfer_prefill(Tensor& q, Tensor& k_cache, Tensor& v_cache, Te
                cudaSuccess;
 }
 
-void attention_backend::prepare_flashinfer_prefill(const int* block_table, int batch_size, int sequence_length,
-                                                   int context_length, int max_context_blocks, int num_qo_heads,
-                                                   int num_kv_heads, int head_dim, cudaStream_t stream)
+Status attention_backend::prepare_flashinfer_prefill(const int* block_table, int batch_size, int sequence_length,
+                                                     int context_length, int max_context_blocks, int num_qo_heads,
+                                                     int num_kv_heads, int head_dim, cudaStream_t stream)
 {
-    if ((head_dim != 128 && head_dim != 256) || sequence_length <= 1 || context_length < 0) return;
+    if ((head_dim != 128 && head_dim != 256) || sequence_length <= 1 || context_length < 0) return {};
     const int total_len = context_length + sequence_length;
     const int pages = (total_len + page_size - 1) / page_size;
-    if (pages > max_context_blocks) return;
+    if (pages > max_context_blocks) return {};
 
     auto& state = prefill_state();
     if (!state.float_workspace)
@@ -687,18 +695,19 @@ void attention_backend::prepare_flashinfer_prefill(const int* block_table, int b
             int_workspace_bytes, state.plan, q_indptr_h.data(), kv_indptr_h.data(), batch_size * sequence_length,
             batch_size, num_qo_heads, num_kv_heads, head_dim, head_dim, page_size, false, 2, -1, -1, false, 0, stream);
         if (status != cudaSuccess)
-            throw std::runtime_error(std::string("FlashInfer prefill planning failed: ") + cudaGetErrorString(status));
+            return unexpected(device::cuda_error(status, "plan FlashInfer prefill"));
         state.batch_size = batch_size;
         state.seq_len = sequence_length;
         state.context_len = context_length;
         state.head_dim = head_dim;
     }
+    return {};
 }
 
-bool attention_backend::launch_flashinfer_prefill(Tensor& q, Tensor& k_cache, Tensor& v_cache, Tensor& output,
-                                                  const int* block_table, int kv_head_num, int seq_len,
-                                                  int max_context_blocks, int context_len, float scale,
-                                                  const device::Context& context)
+Result<bool> attention_backend::launch_flashinfer_prefill(Tensor& q, Tensor& k_cache, Tensor& v_cache,
+                                                          Tensor& output, const int* block_table, int kv_head_num,
+                                                          int seq_len, int max_context_blocks, int context_len,
+                                                          float scale, const device::Context& context)
 {
     const int head_dim = q.shape()[3];
     if ((head_dim != 128 && head_dim != 256) || seq_len <= 1 || context_len < 0) return false;
@@ -796,17 +805,17 @@ bool dispatch_flashinfer_prefill_ragged(Tensor& q, Tensor& k_cache, Tensor& v_ca
                Variant>(params, tmp_v, tmp_s, false, stream) == cudaSuccess;
 }
 
-void attention_backend::prepare_flashinfer_prefill_ragged(const std::vector<int>& q_indptr,
-                                                          const std::vector<int>& kv_indptr,
-                                                          const std::vector<int>& last_page_len,
-                                                          int max_context_blocks, int num_qo_heads, int num_kv_heads,
-                                                          int head_dim, cudaStream_t stream)
+Status attention_backend::prepare_flashinfer_prefill_ragged(const std::vector<int>& q_indptr,
+                                                            const std::vector<int>& kv_indptr,
+                                                            const std::vector<int>& last_page_len,
+                                                            int max_context_blocks, int num_qo_heads,
+                                                            int num_kv_heads, int head_dim, cudaStream_t stream)
 {
-    if ((head_dim != 128 && head_dim != 256) || q_indptr.size() < 2) return;
+    if ((head_dim != 128 && head_dim != 256) || q_indptr.size() < 2) return {};
     const int batch_size = static_cast<int>(q_indptr.size()) - 1;
     const int total_rows = q_indptr.back();
     const int total_pages = kv_indptr.back();
-    if (batch_size <= 0 || total_rows <= 0 || total_pages <= 0) return;
+    if (batch_size <= 0 || total_rows <= 0 || total_pages <= 0) return {};
 
     auto& state = prefill_state();
     if (!state.float_workspace)
@@ -844,8 +853,7 @@ void attention_backend::prepare_flashinfer_prefill_ragged(const std::vector<int>
         int_workspace_bytes, state.plan, q_indptr_h.data(), kv_indptr_h.data(), total_rows, batch_size, num_qo_heads,
         num_kv_heads, head_dim, head_dim, page_size, false, 2, -1, -1, false, 0, stream);
     if (status != cudaSuccess)
-        throw std::runtime_error(std::string("FlashInfer ragged prefill planning failed: ") +
-                                 cudaGetErrorString(status));
+        return unexpected(device::cuda_error(status, "plan FlashInfer ragged prefill"));
     state.batch_size = batch_size;
     state.seq_len = -1;
     state.context_len = -1;
@@ -854,12 +862,13 @@ void attention_backend::prepare_flashinfer_prefill_ragged(const std::vector<int>
     state.num_kv_heads = num_kv_heads;
     state.total_rows = total_rows;
     state.max_context_blocks = max_context_blocks;
+    return {};
 }
 
-bool attention_backend::launch_flashinfer_prefill_ragged(Tensor& q, Tensor& k_cache, Tensor& v_cache, Tensor& output,
-                                                         const int* block_table, int kv_head_num,
-                                                         int max_context_blocks, float scale,
-                                                         const device::Context& context)
+Result<bool> attention_backend::launch_flashinfer_prefill_ragged(Tensor& q, Tensor& k_cache, Tensor& v_cache,
+                                                                 Tensor& output, const int* block_table,
+                                                                 int kv_head_num, int max_context_blocks,
+                                                                 float scale, const device::Context& context)
 {
     const int head_dim = q.shape()[3];
     const int num_qo_heads = q.shape()[2];
@@ -906,34 +915,39 @@ bool attention_backend::launch_flashinfer_prefill_ragged(Tensor& q, Tensor& k_ca
 
 namespace firefly::kernels
 {
-void prepare_attention_decode(const int*, const int*, int, int, int, int, int, const device::Context&) {}
-void attention_backend::prepare_flashinfer_prefill(const int*, int, int, int, int, int, int, int, cudaStream_t) {}
-void attention_backend::prepare_flashinfer_prefill_ragged(const std::vector<int>&, const std::vector<int>&,
-                                                          const std::vector<int>&, int, int, int, int, cudaStream_t)
+Status prepare_attention_decode(const int*, const int*, int, int, int, int, int, const device::Context&) { return {}; }
+Status attention_backend::prepare_flashinfer_prefill(const int*, int, int, int, int, int, int, int, cudaStream_t)
 {
+    return {};
 }
-bool attention_backend::launch_flashinfer_decode(Tensor&, Tensor&, Tensor&, Tensor&, int, int, float,
-                                                 const device::Context&)
+Status attention_backend::prepare_flashinfer_prefill_ragged(const std::vector<int>&, const std::vector<int>&,
+                                                            const std::vector<int>&, int, int, int, int, cudaStream_t)
 {
-    return false;
+    return {};
 }
-bool attention_backend::launch_flashinfer_contiguous_prefill(Tensor&, Tensor&, Tensor&, Tensor&, int, float,
-                                                             const device::Context&)
-{
-    return false;
-}
-bool attention_backend::launch_flashinfer_quantized_prefill(Tensor&, Tensor&, Tensor&, Tensor&, const int*, Tensor&,
-                                                            int, int, int, float, const device::Context&)
+Result<bool> attention_backend::launch_flashinfer_decode(Tensor&, Tensor&, Tensor&, Tensor&, int, int, float,
+                                                         const device::Context&)
 {
     return false;
 }
-bool attention_backend::launch_flashinfer_prefill(Tensor&, Tensor&, Tensor&, Tensor&, const int*, int, int, int, int,
-                                                  float, const device::Context&)
+Result<bool> attention_backend::launch_flashinfer_contiguous_prefill(Tensor&, Tensor&, Tensor&, Tensor&, int, float,
+                                                                     const device::Context&)
 {
     return false;
 }
-bool attention_backend::launch_flashinfer_prefill_ragged(Tensor&, Tensor&, Tensor&, Tensor&, const int*, int, int,
-                                                         float, const device::Context&)
+Result<bool> attention_backend::launch_flashinfer_quantized_prefill(Tensor&, Tensor&, Tensor&, Tensor&, const int*,
+                                                                    Tensor&, int, int, int, float,
+                                                                    const device::Context&)
+{
+    return false;
+}
+Result<bool> attention_backend::launch_flashinfer_prefill(Tensor&, Tensor&, Tensor&, Tensor&, const int*, int, int,
+                                                          int, int, float, const device::Context&)
+{
+    return false;
+}
+Result<bool> attention_backend::launch_flashinfer_prefill_ragged(Tensor&, Tensor&, Tensor&, Tensor&, const int*, int,
+                                                                 int, float, const device::Context&)
 {
     return false;
 }

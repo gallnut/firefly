@@ -5,7 +5,6 @@
 #include <fstream>
 #include <nlohmann/json.hpp>
 #include <set>
-#include <stdexcept>
 #include <unicode/regex.h>
 #include <unicode/unistr.h>
 
@@ -18,13 +17,12 @@ namespace firefly::model
 
 Tokenizer::~Tokenizer() = default;
 
-bool Tokenizer::load(const std::string& path)
+Status Tokenizer::load(const std::string& path)
 {
     std::ifstream f(path);
     if (!f.is_open())
     {
-        FIREFLY_LOG_ERROR("tokenizer", "failed to open tokenizer path={}", path);
-        return false;
+        return unexpected(Error{ErrorCode::Io, "failed to open tokenizer: " + path});
     }
 
     try
@@ -90,20 +88,22 @@ bool Tokenizer::load(const std::string& path)
             UErrorCode status = U_ZERO_ERROR;
             pretokenizer_pattern_.reset(icu::RegexPattern::compile(
                 icu::UnicodeString::fromUTF8(pattern["Regex"].get<std::string>()), 0, status));
-            if (U_FAILURE(status)) throw std::runtime_error("Failed to compile tokenizer pre-split regex");
+            if (U_FAILURE(status))
+                return unexpected(Error{ErrorCode::Parse, "failed to compile tokenizer pre-split regex",
+                                        static_cast<int>(status)});
             break;
         }
 
-        return true;
+        return {};
     }
-    catch (const std::exception& e)
+    catch (const nlohmann::json::exception& error)
     {
-        FIREFLY_LOG_ERROR("tokenizer", "failed to parse tokenizer JSON path={} error={}", path, e.what());
-        return false;
+        return unexpected(Error{ErrorCode::Parse, "failed to parse tokenizer JSON " + path + ": " +
+                                                      std::string(error.what())});
     }
 }
 
-std::vector<int> Tokenizer::encode(const std::string& text) const
+Result<std::vector<int>> Tokenizer::encode(const std::string& text) const
 {
     std::vector<int> ids;
     if (text.empty()) return ids;
@@ -126,30 +126,34 @@ std::vector<int> Tokenizer::encode(const std::string& text) const
             if (match_special_token(text, next, special, special_id)) break;
             ++next;
         }
-        encode_pretokenized_text(text.substr(pos, next - pos), ids);
+        FIREFLY_TRY(encode_pretokenized_text(text.substr(pos, next - pos), ids));
         pos = next;
     }
 
     return ids;
 }
 
-void Tokenizer::encode_pretokenized_text(const std::string& text, std::vector<int>& ids) const
+Status Tokenizer::encode_pretokenized_text(const std::string& text, std::vector<int>& ids) const
 {
     if (pretokenizer_pattern_)
     {
         UErrorCode status = U_ZERO_ERROR;
         const auto unicode_text = icu::UnicodeString::fromUTF8(text);
         std::unique_ptr<icu::RegexMatcher> matcher(pretokenizer_pattern_->matcher(unicode_text, status));
-        if (U_FAILURE(status)) throw std::runtime_error("Failed to create tokenizer pre-split matcher");
+        if (U_FAILURE(status))
+            return unexpected(Error{ErrorCode::Internal, "failed to create tokenizer pre-split matcher",
+                                    static_cast<int>(status)});
 
         while (matcher->find(status))
         {
             std::string piece;
             matcher->group(status).toUTF8String(piece);
-            if (U_FAILURE(status)) throw std::runtime_error("Failed to apply tokenizer pre-split regex");
-            encode_normal_text(piece, ids);
+            if (U_FAILURE(status))
+                return unexpected(Error{ErrorCode::Internal, "failed to apply tokenizer pre-split regex",
+                                        static_cast<int>(status)});
+            FIREFLY_TRY(encode_normal_text(piece, ids));
         }
-        return;
+        return {};
     }
 
     size_t pos = 0;
@@ -221,14 +225,15 @@ void Tokenizer::encode_pretokenized_text(const std::string& text, std::vector<in
 
         if (pos > start)
         {
-            encode_normal_text(text.substr(start, pos - start), ids);
+            FIREFLY_TRY(encode_normal_text(text.substr(start, pos - start), ids));
         }
     }
+    return {};
 }
 
-void Tokenizer::encode_normal_text(const std::string& text, std::vector<int>& ids) const
+Status Tokenizer::encode_normal_text(const std::string& text, std::vector<int>& ids) const
 {
-    if (text.empty()) return;
+    if (text.empty()) return {};
 
     // 1. Convert string to BPE bytes utilizing the byte encoder
     std::vector<std::string> bpe_chars;
@@ -358,13 +363,14 @@ void Tokenizer::encode_normal_text(const std::string& text, std::vector<int>& id
                 auto        piece_it = token_to_id_.find(piece);
                 if (piece_it == token_to_id_.end())
                 {
-                    throw std::runtime_error("Tokenizer cannot map BPE token: " + token_str);
+                    return unexpected(Error{ErrorCode::Parse, "tokenizer cannot map BPE token: " + token_str});
                 }
                 ids.push_back(piece_it->second);
                 i += len;
             }
         }
     }
+    return {};
 }
 
 std::string Tokenizer::decode(int id) const
@@ -424,7 +430,7 @@ int Tokenizer::token_id(const std::string& token) const
     auto it = token_to_id_.find(token);
     if (it == token_to_id_.end())
     {
-        throw std::runtime_error("Tokenizer missing token: " + token);
+        return -1;
     }
     return it->second;
 }

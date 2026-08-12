@@ -11,10 +11,11 @@ namespace firefly::scheduler
 SequenceScheduler::SequenceScheduler() {}
 
 void SequenceScheduler::init(int max_context_blocks, int max_batch_size_limit, int max_prefill_chunk_size,
-                             bool prefix_cache_enabled)
+                             bool prefix_cache_enabled, int speculative_tokens)
 {
     max_batch_size_limit_ = max_batch_size_limit;
     max_prefill_chunk_size_ = max_prefill_chunk_size;
+    speculative_tokens_ = std::max(speculative_tokens, 0);
     prefix_cache_ = prefix_cache_enabled ? std::make_unique<PrefixCache>(&block_allocator_) : nullptr;
     block_allocator_.init(max_context_blocks, prefix_cache_.get());
     free_state_slots_.resize(max_batch_size_limit_);
@@ -88,7 +89,7 @@ BatchPlan SequenceScheduler::step()
         }
 
         int  current_blocks = req->block_table.size();
-        int  tokens_to_process = 1;
+        int  tokens_to_process = req->generated_tokens.empty() ? 1 : (1 + speculative_tokens_);
 
         if (req->generated_tokens.empty())
         {

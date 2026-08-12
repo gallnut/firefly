@@ -493,17 +493,17 @@ __global__ void paged_decode_split_quantized_dual_tiled_kernel(
 }
 
 template <typename scalar_t>
-void launch_quantized_paged_decode_split(Tensor& q, Tensor& k, Tensor& v, Tensor& output, const Tensor& scales,
-                                         const int* block_table, int kv_head_num, int max_context_blocks,
-                                         const int* context_lens, int batch_size, int num_heads, int head_dim,
-                                         float scale, int max_decode_context_len, cudaStream_t stream)
+Status launch_quantized_paged_decode_split(Tensor& q, Tensor& k, Tensor& v, Tensor& output, const Tensor& scales,
+                                           const int* block_table, int kv_head_num, int max_context_blocks,
+                                           const int* context_lens, int batch_size, int num_heads, int head_dim,
+                                           float scale, int max_decode_context_len, cudaStream_t stream)
 {
     int split_token_limit = max_decode_context_len > 0 ? max_decode_context_len + 1 : max_context_blocks * 16;
     split_token_limit = std::min(split_token_limit, max_context_blocks * 16);
     int num_splits = std::max(1, (split_token_limit + 255) / 256);
-    attention_detail::ensure_decode_workspace(batch_size, num_heads, num_splits, head_dim);
+    FIREFLY_TRY(attention_detail::ensure_decode_workspace(batch_size, num_heads, num_splits, head_dim));
     auto& scratch = attention_detail::decode_workspace();
-    int   threads = attention_detail::thread_count(head_dim);
+    int   threads = FIREFLY_TRY(attention_detail::thread_count(head_dim));
     dim3  grid(num_splits, num_heads, batch_size);
     paged_decode_split_quantized_partial_kernel<scalar_t, 256><<<grid, threads, threads * sizeof(float), stream>>>(
         static_cast<const scalar_t*>(q.data()), static_cast<const int8_t*>(k.data()),
@@ -516,22 +516,23 @@ void launch_quantized_paged_decode_split(Tensor& q, Tensor& k, Tensor& v, Tensor
         static_cast<const float*>(scratch.partial_m.data()), static_cast<const float*>(scratch.partial_l.data()),
         static_cast<const float*>(scratch.partial_acc.data()), static_cast<scalar_t*>(output.data()), num_heads,
         head_dim, num_splits);
+    return {};
 }
 
 template <typename scalar_t>
-void launch_quantized_paged_decode_dual(Tensor& q, Tensor& k, Tensor& v, Tensor& output, const Tensor& scales,
-                                        const int* block_table, int kv_head_num, int max_context_blocks,
-                                        const int* context_lens, int batch_size, int num_heads, int head_dim,
-                                        float scale, int max_decode_context_len, QuantizedQuery quantized_query,
-                                        int split_size, cudaStream_t stream)
+Status launch_quantized_paged_decode_dual(Tensor& q, Tensor& k, Tensor& v, Tensor& output, const Tensor& scales,
+                                          const int* block_table, int kv_head_num, int max_context_blocks,
+                                          const int* context_lens, int batch_size, int num_heads, int head_dim,
+                                          float scale, int max_decode_context_len, QuantizedQuery quantized_query,
+                                          int split_size, cudaStream_t stream)
 {
     int split_token_limit = max_decode_context_len > 0 ? max_decode_context_len + 1 : max_context_blocks * 16;
     split_token_limit = std::min(split_token_limit, max_context_blocks * 16);
-    auto launch = [&](auto split_tag)
+    auto launch = [&](auto split_tag) -> Status
     {
         constexpr int split_size = decltype(split_tag)::value;
         int           num_splits = std::max(1, (split_token_limit + split_size - 1) / split_size);
-        attention_detail::ensure_decode_workspace(batch_size, num_heads, num_splits, head_dim);
+        FIREFLY_TRY(attention_detail::ensure_decode_workspace(batch_size, num_heads, num_splits, head_dim));
         auto&         scratch = attention_detail::decode_workspace();
         const Tensor* quantized_values = quantized_query.values;
         const Tensor* quantized_scales = quantized_query.scales;
@@ -556,33 +557,32 @@ void launch_quantized_paged_decode_dual(Tensor& q, Tensor& k, Tensor& v, Tensor&
             static_cast<const float*>(scratch.partial_m.data()), static_cast<const float*>(scratch.partial_l.data()),
             static_cast<const float*>(scratch.partial_acc.data()), static_cast<scalar_t*>(output.data()), num_heads,
             head_dim, num_splits);
+        return {};
     };
 
     switch (split_size)
     {
         case 128:
-            launch(std::integral_constant<int, 128>{});
-            break;
+            return launch(std::integral_constant<int, 128>{});
         case 512:
-            launch(std::integral_constant<int, 512>{});
-            break;
+            return launch(std::integral_constant<int, 512>{});
         default:
-            launch(std::integral_constant<int, 256>{});
-            break;
+            return launch(std::integral_constant<int, 256>{});
     }
 }
 
 }  // namespace
 
-void attention_detail::launch_quantized_paged(Tensor& query, Tensor& key, Tensor& value, Tensor& output,
-                                              const AttentionOptions& options, const DecodeConfig& decode_config,
-                                              float scale, const device::Context& context)
+Status attention_detail::launch_quantized_paged(Tensor& query, Tensor& key, Tensor& value, Tensor& output,
+                                                const AttentionOptions& options,
+                                                const DecodeConfig& decode_config, float scale,
+                                                const device::Context& context)
 {
     int           batch_size = query.shape()[0];
     int           sequence_length = query.shape()[1];
     int           num_heads = query.shape()[2];
     int           head_dim = query.shape()[3];
-    int           threads = attention_detail::thread_count(head_dim);
+    int           threads = FIREFLY_TRY(attention_detail::thread_count(head_dim));
     const Tensor& scales = *options.kv_scales;
 
     if (sequence_length == 1)
@@ -591,7 +591,7 @@ void attention_detail::launch_quantized_paged(Tensor& query, Tensor& key, Tensor
         {
             if (num_heads == options.kv_head_count * 2 && head_dim == 128)
             {
-                launch_quantized_paged_decode_dual<Scalar>(
+                return launch_quantized_paged_decode_dual<Scalar>(
                     query, key, value, output, scales, options.block_table, options.kv_head_count,
                     options.max_context_blocks, options.context_lengths, batch_size, num_heads, head_dim, scale,
                     options.max_decode_context_length, options.quantized_query, decode_config.split_size,
@@ -599,17 +599,17 @@ void attention_detail::launch_quantized_paged(Tensor& query, Tensor& key, Tensor
             }
             else
             {
-                launch_quantized_paged_decode_split<Scalar>(query, key, value, output, scales, options.block_table,
-                                                            options.kv_head_count, options.max_context_blocks,
-                                                            options.context_lengths, batch_size, num_heads, head_dim,
-                                                            scale, options.max_decode_context_length, context.stream());
+                return launch_quantized_paged_decode_split<Scalar>(
+                    query, key, value, output, scales, options.block_table, options.kv_head_count,
+                    options.max_context_blocks, options.context_lengths, batch_size, num_heads, head_dim, scale,
+                    options.max_decode_context_length, context.stream());
             }
         };
         if (query.dtype() == DType::BF16)
-            launch.template operator()<__nv_bfloat16>();
+            FIREFLY_TRY(launch.template operator()<__nv_bfloat16>());
         else
-            launch.template operator()<half>();
-        return;
+            FIREFLY_TRY(launch.template operator()<half>());
+        return {};
     }
 
     dim3   grid(sequence_length, num_heads, batch_size);
@@ -630,6 +630,7 @@ void attention_detail::launch_quantized_paged(Tensor& query, Tensor& key, Tensor
             static_cast<half*>(output.data()), options.context_lengths, num_heads, options.kv_head_count, head_dim,
             options.max_context_blocks, scale);
     }
+    return {};
 }
 
 }  // namespace firefly::kernels

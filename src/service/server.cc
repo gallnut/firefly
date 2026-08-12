@@ -19,47 +19,60 @@ namespace firefly::service
 {
 namespace
 {
-std::vector<int> parse_prompt(const std::string& body, const model::Tokenizer& tokenizer, int& max_tokens,
-                              bool& ignore_eos)
+Result<std::vector<int>> parse_prompt(const std::string& body, const model::Tokenizer& tokenizer, int& max_tokens,
+                                      bool& ignore_eos)
 {
     using json = nlohmann::json;
     std::vector<int> input_ids;
     int im_start_id = tokenizer.token_id("<|im_start|>");
     int im_end_id = tokenizer.token_id("<|im_end|>");
+    if (im_start_id < 0 || im_end_id < 0)
+        return unexpected(Error{ErrorCode::Parse,
+                                "tokenizer is missing required chat template tokens"});
     max_tokens = 512;
     ignore_eos = false;
 
     if (!body.empty())
     {
-        auto request = json::parse(body);
+        json request;
+        try
+        {
+            request = json::parse(body);
+        }
+        catch (const json::exception& exception)
+        {
+            return unexpected(Error{ErrorCode::Parse, "invalid chat completion JSON: " +
+                                                          std::string(exception.what())});
+        }
         if (request.contains("max_tokens")) max_tokens = request["max_tokens"].get<int>();
         ignore_eos = request.value("ignore_eos", false);
 
-        auto append_message = [&](const std::string& role, const std::string& content)
+        auto append_message = [&](const std::string& role, const std::string& content) -> Status
         {
             input_ids.push_back(im_start_id);
-            auto role_ids = tokenizer.encode(role + "\n");
+            auto role_ids = FIREFLY_TRY(tokenizer.encode(role + "\n"));
             input_ids.insert(input_ids.end(), role_ids.begin(), role_ids.end());
-            auto content_ids = tokenizer.encode(content);
+            auto content_ids = FIREFLY_TRY(tokenizer.encode(content));
             input_ids.insert(input_ids.end(), content_ids.begin(), content_ids.end());
             input_ids.push_back(im_end_id);
-            auto newline_ids = tokenizer.encode("\n");
+            auto newline_ids = FIREFLY_TRY(tokenizer.encode("\n"));
             input_ids.insert(input_ids.end(), newline_ids.begin(), newline_ids.end());
+            return {};
         };
 
         if (request.contains("messages") && request["messages"].is_array())
         {
             for (const auto& message : request["messages"])
-                append_message(message.value("role", "user"), message.value("content", ""));
+                FIREFLY_TRY(append_message(message.value("role", "user"), message.value("content", "")));
         }
         else if (request.contains("prompt"))
         {
-            append_message("user", request["prompt"].get<std::string>());
+            FIREFLY_TRY(append_message("user", request["prompt"].get<std::string>()));
         }
     }
 
     input_ids.push_back(im_start_id);
-    auto assistant_ids = tokenizer.encode("assistant\n");
+    auto assistant_ids = FIREFLY_TRY(tokenizer.encode("assistant\n"));
     input_ids.insert(input_ids.end(), assistant_ids.begin(), assistant_ids.end());
     return input_ids;
 }
@@ -75,14 +88,16 @@ public:
 
     ~Impl() { stop_dispatcher(); }
 
-    void run(int port)
+    Status run(int port)
     {
         start_dispatcher();
         GrpcAdapter adapter;
-        adapter.start_server(port,
-                             [this](const std::string& body, bool, std::shared_ptr<Session> session)
-                             { submit(body, std::move(session)); });
+        Status status = adapter.start_server(port,
+                                             [this](const std::string& body, bool,
+                                                    std::shared_ptr<Session> session)
+                                             { submit(body, std::move(session)); });
         stop_dispatcher();
+        return status;
     }
 
 private:
@@ -126,25 +141,25 @@ private:
 
     void submit(const std::string& body, std::shared_ptr<Session> session)
     {
-        try
-        {
-            int max_tokens = 0;
-            bool ignore_eos = false;
-            auto input_ids = parse_prompt(body, tokenizer_, max_tokens, ignore_eos);
-            auto request_id = "req-" + std::to_string(next_request_id_.fetch_add(1));
-            {
-                std::lock_guard<std::mutex> lock(sessions_mutex_);
-                sessions_[request_id] = session;
-            }
-            FIREFLY_LOG_DEBUG("service", "chat completion accepted max_tokens={}", max_tokens);
-            engine_.async_generate(request_id, input_ids, max_tokens, session->cancel_flag, ignore_eos);
-        }
-        catch (const std::exception& error)
+        int max_tokens = 0;
+        bool ignore_eos = false;
+        auto input_ids_result = parse_prompt(body, tokenizer_, max_tokens, ignore_eos);
+        if (!input_ids_result)
         {
             nlohmann::json response;
-            response["error"] = {{"message", error.what()}, {"type", "server_error"}};
+            response["error"] = {{"message", input_ids_result.error().describe()},
+                                 {"type", "invalid_request_error"}};
             session->push(response.dump(), true);
+            return;
         }
+        auto input_ids = std::move(input_ids_result.value());
+        auto request_id = "req-" + std::to_string(next_request_id_.fetch_add(1));
+        {
+            std::lock_guard<std::mutex> lock(sessions_mutex_);
+            sessions_[request_id] = session;
+        }
+        FIREFLY_LOG_DEBUG("service", "chat completion accepted max_tokens={}", max_tokens);
+        engine_.async_generate(request_id, input_ids, max_tokens, session->cancel_flag, ignore_eos);
     }
 
     execution::Engine& engine_;
@@ -164,6 +179,6 @@ Server::Server(execution::Engine& engine, const model::Tokenizer& tokenizer, exe
 
 Server::~Server() = default;
 
-void Server::run(int port) { impl_->run(port); }
+Status Server::run(int port) { return impl_->run(port); }
 
 }  // namespace firefly::service

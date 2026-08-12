@@ -1,4 +1,5 @@
 #include "firefly/kernels/attention/hybrid_attention.h"
+#include "firefly/device/error.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -143,32 +144,34 @@ __global__ void attention_gate_kernel(scalar_t* output, const scalar_t* gate, in
 }
 
 template <typename Function>
-void dispatch_half_type(DType dtype, Function&& function)
+Status dispatch_half_type(DType dtype, Function&& function)
 {
-    require_float16_or_bfloat16(dtype, "hybrid attention kernel");
+    FIREFLY_TRY(require_float16_or_bfloat16(dtype, "hybrid attention kernel"));
     if (dtype == DType::BF16) function.template operator()<__nv_bfloat16>();
     else function.template operator()<half>();
+    return {};
 }
 
-void check_launch(const char* operation)
+Status check_launch(const char* operation)
 {
     const cudaError_t error = cudaGetLastError();
-    if (error != cudaSuccess) throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(error));
+    if (error != cudaSuccess) return unexpected(device::cuda_error(error, operation));
+    return {};
 }
 }  // namespace
 
-void prepare_full_attention(const Tensor& projected_query, Tensor& query, Tensor& gate, Tensor& key,
-                            const Tensor& query_norm, const Tensor& key_norm, const int* context_lengths,
-                            int sequence_length, int rotary_dimension, float rope_theta, double epsilon,
-                            const device::Context& context)
+Status prepare_full_attention(const Tensor& projected_query, Tensor& query, Tensor& gate, Tensor& key,
+                              const Tensor& query_norm, const Tensor& key_norm, const int* context_lengths,
+                              int sequence_length, int rotary_dimension, float rope_theta, double epsilon,
+                              const device::Context& context)
 {
     const int tokens = query.shape()[0] * query.shape()[1];
     const int query_heads = query.shape()[2];
     const int key_heads = key.shape()[2];
     const int head_dim = query.shape()[3];
     if (key.shape()[3] != head_dim || projected_query.numel() != query.numel() * 2 || gate.numel() != query.numel())
-        throw std::runtime_error("invalid hybrid full-attention tensor shape");
-    dispatch_half_type(query.dtype(), [&]<typename scalar_t>()
+        return unexpected(Error{ErrorCode::InvalidArgument, "invalid hybrid full-attention tensor shape"});
+    FIREFLY_TRY(dispatch_half_type(query.dtype(), [&]<typename scalar_t>()
     {
         dim3 grid(tokens, std::max(query_heads, key_heads));
         prepare_full_attention_kernel<scalar_t><<<grid, 256, 0, context.stream()>>>(
@@ -177,21 +180,22 @@ void prepare_full_attention(const Tensor& projected_query, Tensor& query, Tensor
             static_cast<const scalar_t*>(query_norm.data()), static_cast<const scalar_t*>(key_norm.data()),
             context_lengths, sequence_length, query_heads, key_heads, head_dim, rotary_dimension, rope_theta,
             static_cast<float>(epsilon));
-    });
-    check_launch("hybrid full-attention preparation");
+    }));
+    return check_launch("hybrid full-attention preparation");
 }
 
-void apply_attention_gate(Tensor& attention_output, const Tensor& gate, const device::Context& context)
+Status apply_attention_gate(Tensor& attention_output, const Tensor& gate, const device::Context& context)
 {
-    if (attention_output.numel() != gate.numel()) throw std::runtime_error("attention gate tensor size mismatch");
-    dispatch_half_type(attention_output.dtype(), [&]<typename scalar_t>()
+    if (attention_output.numel() != gate.numel())
+        return unexpected(Error{ErrorCode::InvalidArgument, "attention gate tensor size mismatch"});
+    FIREFLY_TRY(dispatch_half_type(attention_output.dtype(), [&]<typename scalar_t>()
     {
         const int blocks = std::min<int64_t>((attention_output.numel() + 255) / 256, 4096);
         attention_gate_kernel<scalar_t><<<blocks, 256, 0, context.stream()>>>(
             static_cast<scalar_t*>(attention_output.data()), static_cast<const scalar_t*>(gate.data()),
             attention_output.numel());
-    });
-    check_launch("hybrid attention gate");
+    }));
+    return check_launch("hybrid attention gate");
 }
 
 }  // namespace firefly::kernels

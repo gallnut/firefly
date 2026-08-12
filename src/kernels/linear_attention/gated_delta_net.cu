@@ -49,7 +49,7 @@ struct GatedDeltaNetWorkspace::Impl
 
 namespace
 {
-void check_launch(const char* operation);
+Status check_launch(const char* operation);
 
 template <typename T>
 struct Scalar;
@@ -127,15 +127,16 @@ __device__ inline void cute_bf16_mma_tile(const __nv_bfloat16* a_data, const __n
     copy(tCrC, tCgC);
 }
 
-void reserve_tensor(Tensor& tensor, int64_t elements, DType dtype, const device::Context& context)
+Status reserve_tensor(Tensor& tensor, int64_t elements, DType dtype, const device::Context& context)
 {
-    if (tensor.data() && tensor.dtype() == dtype && tensor.numel() >= elements) return;
-    tensor = Tensor({elements}, dtype, Device::CUDA, context);
+    if (tensor.data() && tensor.dtype() == dtype && tensor.numel() >= elements) return {};
+    tensor = FIREFLY_TRY(Tensor::create({elements}, dtype, Device::CUDA, context));
+    return {};
 }
 
 template <int HeadDimension, int ChunkSize>
-void reserve_chunk_workspace(GatedDeltaNetWorkspace::Impl& workspace, int batch, int sequence_length,
-                             int head_count, DType scalar_dtype, const device::Context& context)
+Status reserve_chunk_workspace(GatedDeltaNetWorkspace::Impl& workspace, int batch, int sequence_length,
+                               int head_count, DType scalar_dtype, const device::Context& context)
 {
     const int padded_length = ((sequence_length + ChunkSize - 1) / ChunkSize) * ChunkSize;
     const int chunks_per_head = padded_length / ChunkSize;
@@ -146,26 +147,27 @@ void reserve_chunk_workspace(GatedDeltaNetWorkspace::Impl& workspace, int batch,
     const int64_t working_state_elements = head_batches * HeadDimension * HeadDimension;
     const int64_t token_elements = head_batches * padded_length;
 
-    reserve_tensor(workspace.query, packed_elements, scalar_dtype, context);
-    reserve_tensor(workspace.key, packed_elements, scalar_dtype, context);
-    reserve_tensor(workspace.value, packed_elements, scalar_dtype, context);
-    reserve_tensor(workspace.log_decay, token_elements, DType::F32, context);
-    reserve_tensor(workspace.beta_values, token_elements, DType::F32, context);
-    reserve_tensor(workspace.key_beta_exp, packed_elements, scalar_dtype, context);
-    reserve_tensor(workspace.key_exp_negative, packed_elements, scalar_dtype, context);
-    reserve_tensor(workspace.beta_value, packed_elements, scalar_dtype, context);
-    reserve_tensor(workspace.cumulative_decay, token_elements, DType::F32, context);
-    reserve_tensor(workspace.matrix, matrix_elements, DType::F32, context);
-    reserve_tensor(workspace.inverse, matrix_elements, scalar_dtype, context);
-    reserve_tensor(workspace.w, packed_elements, scalar_dtype, context);
-    reserve_tensor(workspace.u, packed_elements, scalar_dtype, context);
-    reserve_tensor(workspace.chunk_states, state_elements, scalar_dtype, context);
-    reserve_tensor(workspace.working_state, working_state_elements, DType::F32, context);
-    reserve_tensor(workspace.projected, packed_elements, DType::F32, context);
-    reserve_tensor(workspace.new_value, packed_elements, scalar_dtype, context);
-    reserve_tensor(workspace.scaled_value, packed_elements, scalar_dtype, context);
-    reserve_tensor(workspace.packed_output, packed_elements, DType::F32, context);
-    reserve_tensor(workspace.scaled_scores, matrix_elements, scalar_dtype, context);
+    FIREFLY_TRY(reserve_tensor(workspace.query, packed_elements, scalar_dtype, context));
+    FIREFLY_TRY(reserve_tensor(workspace.key, packed_elements, scalar_dtype, context));
+    FIREFLY_TRY(reserve_tensor(workspace.value, packed_elements, scalar_dtype, context));
+    FIREFLY_TRY(reserve_tensor(workspace.log_decay, token_elements, DType::F32, context));
+    FIREFLY_TRY(reserve_tensor(workspace.beta_values, token_elements, DType::F32, context));
+    FIREFLY_TRY(reserve_tensor(workspace.key_beta_exp, packed_elements, scalar_dtype, context));
+    FIREFLY_TRY(reserve_tensor(workspace.key_exp_negative, packed_elements, scalar_dtype, context));
+    FIREFLY_TRY(reserve_tensor(workspace.beta_value, packed_elements, scalar_dtype, context));
+    FIREFLY_TRY(reserve_tensor(workspace.cumulative_decay, token_elements, DType::F32, context));
+    FIREFLY_TRY(reserve_tensor(workspace.matrix, matrix_elements, DType::F32, context));
+    FIREFLY_TRY(reserve_tensor(workspace.inverse, matrix_elements, scalar_dtype, context));
+    FIREFLY_TRY(reserve_tensor(workspace.w, packed_elements, scalar_dtype, context));
+    FIREFLY_TRY(reserve_tensor(workspace.u, packed_elements, scalar_dtype, context));
+    FIREFLY_TRY(reserve_tensor(workspace.chunk_states, state_elements, scalar_dtype, context));
+    FIREFLY_TRY(reserve_tensor(workspace.working_state, working_state_elements, DType::F32, context));
+    FIREFLY_TRY(reserve_tensor(workspace.projected, packed_elements, DType::F32, context));
+    FIREFLY_TRY(reserve_tensor(workspace.new_value, packed_elements, scalar_dtype, context));
+    FIREFLY_TRY(reserve_tensor(workspace.scaled_value, packed_elements, scalar_dtype, context));
+    FIREFLY_TRY(reserve_tensor(workspace.packed_output, packed_elements, DType::F32, context));
+    FIREFLY_TRY(reserve_tensor(workspace.scaled_scores, matrix_elements, scalar_dtype, context));
+    return {};
 }
 
 struct CublasState
@@ -173,31 +175,31 @@ struct CublasState
     cublasHandle_t handle = nullptr;
     cudaStream_t stream = nullptr;
 
-    CublasState()
-    {
-        const cublasStatus_t status = cublasCreate(&handle);
-        if (status != CUBLAS_STATUS_SUCCESS)
-            throw std::runtime_error("linear attention GDN failed to create cuBLAS handle status=" +
-                                     std::to_string(static_cast<int>(status)));
-        cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH);
-    }
-
     ~CublasState()
     {
         if (handle) cublasDestroy(handle);
     }
 };
 
-CublasState& cublas_state(cudaStream_t stream)
+Result<CublasState*> cublas_state(cudaStream_t stream)
 {
     static thread_local CublasState state;
+    if (!state.handle)
+    {
+        const cublasStatus_t status = cublasCreate(&state.handle);
+        if (status != CUBLAS_STATUS_SUCCESS)
+            return unexpected(Error{ErrorCode::Cublas, "linear attention GDN failed to create cuBLAS handle",
+                                    static_cast<int>(status)});
+    }
     if (state.stream != stream)
     {
-        if (cublasSetStream(state.handle, stream) != CUBLAS_STATUS_SUCCESS)
-            throw std::runtime_error("linear attention GDN failed to set cuBLAS stream");
+        const cublasStatus_t status = cublasSetStream(state.handle, stream);
+        if (status != CUBLAS_STATUS_SUCCESS)
+            return unexpected(Error{ErrorCode::Cublas, "linear attention GDN failed to set cuBLAS stream",
+                                    static_cast<int>(status)});
         state.stream = stream;
     }
-    return state;
+    return &state;
 }
 
 template <typename scalar_t>
@@ -208,22 +210,24 @@ constexpr cudaDataType_t cublas_data_type()
 }
 
 template <typename scalar_t>
-void batched_gemm(const scalar_t* a, const scalar_t* b, void* c, int rows, int columns, int inner,
-                  bool transpose_a, bool transpose_b, int64_t stride_a, int64_t stride_b, int64_t stride_c,
-                  int batch_count, cudaDataType_t output_type, float alpha, float beta, cudaStream_t stream)
+Status batched_gemm(const scalar_t* a, const scalar_t* b, void* c, int rows, int columns, int inner,
+                    bool transpose_a, bool transpose_b, int64_t stride_a, int64_t stride_b, int64_t stride_c,
+                    int batch_count, cudaDataType_t output_type, float alpha, float beta, cudaStream_t stream)
 {
     const cublasOperation_t operation_b = transpose_b ? CUBLAS_OP_T : CUBLAS_OP_N;
     const cublasOperation_t operation_a = transpose_a ? CUBLAS_OP_T : CUBLAS_OP_N;
     const int leading_b = transpose_b ? inner : columns;
     const int leading_a = transpose_a ? rows : inner;
     const auto input_type = cublas_data_type<scalar_t>();
-    auto& state = cublas_state(stream);
+    CublasState* state = FIREFLY_TRY(cublas_state(stream));
     const cublasStatus_t status = cublasGemmStridedBatchedEx(
-        state.handle, operation_b, operation_a, columns, rows, inner, &alpha, b, input_type, leading_b, stride_b,
+        state->handle, operation_b, operation_a, columns, rows, inner, &alpha, b, input_type, leading_b, stride_b,
         a, input_type, leading_a, stride_a, &beta, c, output_type, columns, stride_c, batch_count,
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     if (status != CUBLAS_STATUS_SUCCESS)
-        throw std::runtime_error("linear attention GDN batched GEMM failed with status " + std::to_string(status));
+        return unexpected(Error{ErrorCode::Cublas, "linear attention GDN batched GEMM failed",
+                                static_cast<int>(status)});
+    return {};
 }
 
 __device__ __forceinline__ float warp_sum(float value)
@@ -1288,21 +1292,21 @@ __global__ void gdn_scatter_state_kernel(const float* working_state, state_scala
 }
 
 template <typename scalar_t, typename state_scalar_t, int HeadDimension, int ChunkSize>
-void gated_delta_net_chunk(const scalar_t* mixed_qkv, const scalar_t* gate, const scalar_t* decay,
-                           const scalar_t* beta, const float* decay_log, const scalar_t* decay_bias,
-                           const float* norm_weight, state_scalar_t* states, const int* state_slots,
-                           const int* context_lengths, scalar_t* output, int batch, int sequence_length,
-                           int head_count, int gate_stride, int scalar_stride,
-                           GatedDeltaNetWorkspace::Impl& workspace, float epsilon,
-                           const device::Context& context)
+Status gated_delta_net_chunk(const scalar_t* mixed_qkv, const scalar_t* gate, const scalar_t* decay,
+                             const scalar_t* beta, const float* decay_log, const scalar_t* decay_bias,
+                             const float* norm_weight, state_scalar_t* states, const int* state_slots,
+                             const int* context_lengths, scalar_t* output, int batch, int sequence_length,
+                             int head_count, int gate_stride, int scalar_stride,
+                             GatedDeltaNetWorkspace::Impl& workspace, float epsilon,
+                             const device::Context& context)
 {
     const int padded_length = ((sequence_length + ChunkSize - 1) / ChunkSize) * ChunkSize;
     const int chunks_per_head = padded_length / ChunkSize;
     const int head_batches = batch * head_count;
     const int matrix_count = head_batches * chunks_per_head;
     const DType scalar_dtype = std::is_same_v<scalar_t, __nv_bfloat16> ? DType::BF16 : DType::F16;
-    reserve_chunk_workspace<HeadDimension, ChunkSize>(workspace, batch, sequence_length, head_count, scalar_dtype,
-                                                       context);
+    FIREFLY_TRY((reserve_chunk_workspace<HeadDimension, ChunkSize>(
+        workspace, batch, sequence_length, head_count, scalar_dtype, context)));
     Tensor& query = workspace.query;
     Tensor& key = workspace.key;
     Tensor& value = workspace.value;
@@ -1355,22 +1359,22 @@ void gated_delta_net_chunk(const scalar_t* mixed_qkv, const scalar_t* gate, cons
     constexpr int64_t chunk_vector_elements = ChunkSize * HeadDimension;
     constexpr int64_t chunk_matrix_elements = ChunkSize * ChunkSize;
     constexpr int64_t state_elements = HeadDimension * HeadDimension;
-    batched_gemm(static_cast<const scalar_t*>(key_exp_negative.data()), static_cast<const scalar_t*>(key.data()),
-                 matrix.data(), ChunkSize, ChunkSize,
-                 HeadDimension, false, true, chunk_vector_elements, chunk_vector_elements, chunk_matrix_elements,
-                 matrix_count, CUDA_R_32F, 1.0f, 0.0f, context.stream());
+    FIREFLY_TRY(batched_gemm(
+        static_cast<const scalar_t*>(key_exp_negative.data()), static_cast<const scalar_t*>(key.data()),
+        matrix.data(), ChunkSize, ChunkSize, HeadDimension, false, true, chunk_vector_elements,
+        chunk_vector_elements, chunk_matrix_elements, matrix_count, CUDA_R_32F, 1.0f, 0.0f, context.stream()));
     constexpr int solve_threads = std::max(ChunkSize, warp_size);
     gdn_scale_solve_lower_kernel<scalar_t, ChunkSize><<<matrix_count, solve_threads, 0, context.stream()>>>(
         static_cast<const float*>(matrix.data()), static_cast<const float*>(cumulative_decay.data()),
         static_cast<scalar_t*>(inverse.data()), sequence_length, padded_length, matrix_count);
-    batched_gemm(static_cast<const scalar_t*>(inverse.data()), static_cast<const scalar_t*>(key_beta_exp.data()),
-                 w.data(), ChunkSize, HeadDimension, ChunkSize, false, false, chunk_matrix_elements,
-                 chunk_vector_elements, chunk_vector_elements, matrix_count, cublas_data_type<scalar_t>(), 1.0f,
-                 0.0f, context.stream());
-    batched_gemm(static_cast<const scalar_t*>(inverse.data()), static_cast<const scalar_t*>(beta_value.data()),
-                 u.data(), ChunkSize, HeadDimension, ChunkSize, false, false, chunk_matrix_elements,
-                 chunk_vector_elements, chunk_vector_elements, matrix_count, cublas_data_type<scalar_t>(), 1.0f,
-                 0.0f, context.stream());
+    FIREFLY_TRY(batched_gemm(
+        static_cast<const scalar_t*>(inverse.data()), static_cast<const scalar_t*>(key_beta_exp.data()), w.data(),
+        ChunkSize, HeadDimension, ChunkSize, false, false, chunk_matrix_elements, chunk_vector_elements,
+        chunk_vector_elements, matrix_count, cublas_data_type<scalar_t>(), 1.0f, 0.0f, context.stream()));
+    FIREFLY_TRY(batched_gemm(
+        static_cast<const scalar_t*>(inverse.data()), static_cast<const scalar_t*>(beta_value.data()), u.data(),
+        ChunkSize, HeadDimension, ChunkSize, false, false, chunk_matrix_elements, chunk_vector_elements,
+        chunk_vector_elements, matrix_count, cublas_data_type<scalar_t>(), 1.0f, 0.0f, context.stream()));
 
     constexpr int state_tiles = 8;
     dim3 state_grid(head_batches, state_tiles);
@@ -1380,34 +1384,36 @@ void gated_delta_net_chunk(const scalar_t* mixed_qkv, const scalar_t* gate, cons
     const char* prefill_backend = std::getenv("FIREFLY_QWEN35_GDN_PREFILL_BACKEND");
     const bool use_fused = std::is_same_v<scalar_t, __nv_bfloat16> &&
                            (!prefill_backend || std::strcmp(prefill_backend, "fused") == 0);
-    auto run_chunk_recurrence = [&]()
+    auto run_chunk_recurrence = [&]() -> Status
     {
         for (int chunk = 0; chunk < chunks_per_head; ++chunk)
         {
             gdn_save_state_kernel<scalar_t, HeadDimension><<<state_grid, 256, 0, context.stream()>>>(
                 static_cast<const float*>(working_state.data()), static_cast<scalar_t*>(chunk_states.data()),
                 chunk, chunks_per_head, head_batches);
-            batched_gemm(static_cast<const scalar_t*>(w.data()) + chunk * chunk_vector_elements,
-                         static_cast<const scalar_t*>(chunk_states.data()) + chunk * state_elements,
-                         static_cast<float*>(projected.data()) + chunk * chunk_vector_elements, ChunkSize,
-                         HeadDimension, HeadDimension, false, false,
-                         static_cast<int64_t>(padded_length) * HeadDimension,
-                         static_cast<int64_t>(chunks_per_head) * state_elements,
-                         static_cast<int64_t>(padded_length) * HeadDimension, head_batches, CUDA_R_32F, 1.0f,
-                         0.0f, context.stream());
+            FIREFLY_TRY(batched_gemm(
+                static_cast<const scalar_t*>(w.data()) + chunk * chunk_vector_elements,
+                static_cast<const scalar_t*>(chunk_states.data()) + chunk * state_elements,
+                static_cast<float*>(projected.data()) + chunk * chunk_vector_elements, ChunkSize, HeadDimension,
+                HeadDimension, false, false, static_cast<int64_t>(padded_length) * HeadDimension,
+                static_cast<int64_t>(chunks_per_head) * state_elements,
+                static_cast<int64_t>(padded_length) * HeadDimension, head_batches, CUDA_R_32F, 1.0f, 0.0f,
+                context.stream()));
             gdn_prepare_state_update_kernel<scalar_t, HeadDimension, ChunkSize>
                 <<<state_grid, 256, 0, context.stream()>>>(
                     static_cast<const float*>(projected.data()), static_cast<const scalar_t*>(u.data()),
                     static_cast<const float*>(cumulative_decay.data()), static_cast<scalar_t*>(new_value.data()),
                     static_cast<scalar_t*>(scaled_value.data()), static_cast<float*>(working_state.data()), chunk,
                     sequence_length, padded_length, head_batches);
-            batched_gemm(static_cast<const scalar_t*>(key.data()) + chunk * chunk_vector_elements,
-                         static_cast<const scalar_t*>(scaled_value.data()) + chunk * chunk_vector_elements,
-                         working_state.data(), HeadDimension, HeadDimension, ChunkSize, true, false,
-                         static_cast<int64_t>(padded_length) * HeadDimension,
-                         static_cast<int64_t>(padded_length) * HeadDimension, state_elements, head_batches,
-                         CUDA_R_32F, 1.0f, 1.0f, context.stream());
+            FIREFLY_TRY(batched_gemm(
+                static_cast<const scalar_t*>(key.data()) + chunk * chunk_vector_elements,
+                static_cast<const scalar_t*>(scaled_value.data()) + chunk * chunk_vector_elements,
+                working_state.data(), HeadDimension, HeadDimension, ChunkSize, true, false,
+                static_cast<int64_t>(padded_length) * HeadDimension,
+                static_cast<int64_t>(padded_length) * HeadDimension, state_elements, head_batches, CUDA_R_32F,
+                1.0f, 1.0f, context.stream()));
         }
+        return {};
     };
     if (use_fused)
     {
@@ -1426,7 +1432,8 @@ void gated_delta_net_chunk(const scalar_t* mixed_qkv, const scalar_t* gate, cons
                                         fused_state_bytes) == cudaSuccess;
         }();
         if (!fused_state_configured)
-            throw std::runtime_error("linear attention fused GDN recurrence shared memory exceeds device limit");
+            return unexpected(Error{ErrorCode::Unavailable,
+                                    "linear attention fused GDN recurrence shared memory exceeds device limit"});
         dim3 fused_grid(head_batches, HeadDimension / VBlock);
         gdn_chunk_delta_h_cute_kernel<HeadDimension, VBlock, FusedChunkSize, WarpCount>
             <<<fused_grid, WarpCount * warp_size, fused_state_bytes, context.stream()>>>(
@@ -1437,53 +1444,57 @@ void gated_delta_net_chunk(const scalar_t* mixed_qkv, const scalar_t* gate, cons
                 static_cast<__nv_bfloat16*>(new_value.data()),
                 static_cast<__nv_bfloat16*>(scaled_value.data()), static_cast<float*>(working_state.data()),
                 sequence_length, padded_length, chunks_per_head);
-        check_launch("linear attention fused GDN recurrence");
+        FIREFLY_TRY(check_launch("linear attention fused GDN recurrence"));
     }
-    if (!use_fused) run_chunk_recurrence();
+    if (!use_fused) FIREFLY_TRY(run_chunk_recurrence());
 
-    batched_gemm(static_cast<const scalar_t*>(query.data()), static_cast<const scalar_t*>(chunk_states.data()),
-                 packed_output.data(), ChunkSize, HeadDimension, HeadDimension, false, false,
-                 chunk_vector_elements, state_elements, chunk_vector_elements, matrix_count, CUDA_R_32F, 1.0f, 0.0f,
-                 context.stream());
-    batched_gemm(static_cast<const scalar_t*>(query.data()), static_cast<const scalar_t*>(key.data()), matrix.data(),
-                 ChunkSize, ChunkSize, HeadDimension, false, true, chunk_vector_elements, chunk_vector_elements,
-                 chunk_matrix_elements, matrix_count, CUDA_R_32F, 1.0f, 0.0f, context.stream());
+    FIREFLY_TRY(batched_gemm(
+        static_cast<const scalar_t*>(query.data()), static_cast<const scalar_t*>(chunk_states.data()),
+        packed_output.data(), ChunkSize, HeadDimension, HeadDimension, false, false, chunk_vector_elements,
+        state_elements, chunk_vector_elements, matrix_count, CUDA_R_32F, 1.0f, 0.0f, context.stream()));
+    FIREFLY_TRY(batched_gemm(
+        static_cast<const scalar_t*>(query.data()), static_cast<const scalar_t*>(key.data()), matrix.data(),
+        ChunkSize, ChunkSize, HeadDimension, false, true, chunk_vector_elements, chunk_vector_elements,
+        chunk_matrix_elements, matrix_count, CUDA_R_32F, 1.0f, 0.0f, context.stream()));
     gdn_scale_chunk_output_kernel<scalar_t, ChunkSize><<<matrix_count, 256, 0, context.stream()>>>(
         static_cast<float*>(packed_output.data()), static_cast<const float*>(matrix.data()),
         static_cast<scalar_t*>(scaled_scores.data()), static_cast<const float*>(cumulative_decay.data()),
         sequence_length, padded_length, matrix_count);
-    batched_gemm(static_cast<const scalar_t*>(scaled_scores.data()), static_cast<const scalar_t*>(new_value.data()),
-                 packed_output.data(), ChunkSize, HeadDimension, ChunkSize, false, false, chunk_matrix_elements,
-                 chunk_vector_elements, chunk_vector_elements, matrix_count, CUDA_R_32F, 1.0f, 1.0f,
-                 context.stream());
+    FIREFLY_TRY(batched_gemm(
+        static_cast<const scalar_t*>(scaled_scores.data()), static_cast<const scalar_t*>(new_value.data()),
+        packed_output.data(), ChunkSize, HeadDimension, ChunkSize, false, false, chunk_matrix_elements,
+        chunk_vector_elements, chunk_vector_elements, matrix_count, CUDA_R_32F, 1.0f, 1.0f, context.stream()));
     gdn_unpack_output_kernel<scalar_t, HeadDimension><<<token_rows, HeadDimension, 0, context.stream()>>>(
         static_cast<const float*>(packed_output.data()), gate, norm_weight, output, sequence_length, padded_length,
         head_count, gate_stride, epsilon);
     gdn_scatter_state_kernel<state_scalar_t, HeadDimension><<<state_grid, 256, 0, context.stream()>>>(
         static_cast<const float*>(working_state.data()), states, state_slots, head_count, head_batches);
+    return {};
 }
 
 template <typename Function>
-void dispatch_half_type(DType dtype, Function&& function)
+Status dispatch_half_type(DType dtype, Function&& function)
 {
-    require_float16_or_bfloat16(dtype, "linear attention kernel");
-    if (dtype == DType::BF16) function.template operator()<__nv_bfloat16>();
-    else function.template operator()<half>();
+    FIREFLY_TRY(require_float16_or_bfloat16(dtype, "linear attention kernel"));
+    if (dtype == DType::BF16) return function.template operator()<__nv_bfloat16>();
+    return function.template operator()<half>();
 }
 
 template <typename Function>
-void dispatch_state_type(DType dtype, Function&& function)
+Status dispatch_state_type(DType dtype, Function&& function)
 {
-    if (dtype == DType::BF16) function.template operator()<__nv_bfloat16>();
-    else if (dtype == DType::F16) function.template operator()<half>();
-    else if (dtype == DType::F32) function.template operator()<float>();
-    else throw std::runtime_error("linear attention recurrent state dtype must be F16, BF16, or F32");
+    if (dtype == DType::BF16) return function.template operator()<__nv_bfloat16>();
+    if (dtype == DType::F16) return function.template operator()<half>();
+    if (dtype == DType::F32) return function.template operator()<float>();
+    return unexpected(Error{ErrorCode::InvalidArgument,
+                            "linear attention recurrent state dtype must be F16, BF16, or F32"});
 }
 
-void check_launch(const char* operation)
+Status check_launch(const char* operation)
 {
     const cudaError_t error = cudaGetLastError();
-    if (error != cudaSuccess) throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(error));
+    if (error != cudaSuccess) return unexpected(device::cuda_error(error, operation));
+    return {};
 }
 }  // namespace
 
@@ -1493,17 +1504,19 @@ GatedDeltaNetWorkspace::GatedDeltaNetWorkspace(GatedDeltaNetWorkspace&&) noexcep
 GatedDeltaNetWorkspace& GatedDeltaNetWorkspace::operator=(GatedDeltaNetWorkspace&&) noexcept = default;
 
 
-void causal_convolution(const Tensor& projected_qkv, const Tensor& weight, Tensor& convolution_state,
-                        const int* state_slots, const int* context_lengths, Tensor& output,
-                        const device::Context& context)
+Status causal_convolution(const Tensor& projected_qkv, const Tensor& weight, Tensor& convolution_state,
+                          const int* state_slots, const int* context_lengths, Tensor& output,
+                          const device::Context& context)
 {
-    if (!state_slots) throw std::runtime_error("linear attention causal convolution requires state slots");
+    if (!state_slots)
+        return unexpected(Error{ErrorCode::InvalidArgument,
+                                "linear attention causal convolution requires state slots"});
     const int batch = projected_qkv.shape()[0];
     const int sequence_length = projected_qkv.shape()[1];
     const int channels = projected_qkv.shape()[2];
     const int input_stride = projected_qkv.strides()[1];
     const int kernel_size = weight.shape().back();
-    dispatch_half_type(projected_qkv.dtype(), [&]<typename scalar_t>()
+    FIREFLY_TRY(dispatch_half_type(projected_qkv.dtype(), [&]<typename scalar_t>() -> Status
     {
         if (sequence_length == 1)
         {
@@ -1512,7 +1525,7 @@ void causal_convolution(const Tensor& projected_qkv, const Tensor& weight, Tenso
                 static_cast<const scalar_t*>(projected_qkv.data()), static_cast<const scalar_t*>(weight.data()),
                 static_cast<scalar_t*>(convolution_state.data()), state_slots, context_lengths,
                 static_cast<scalar_t*>(output.data()), sequence_length, channels, input_stride, kernel_size);
-            return;
+            return {};
         }
         constexpr int token_tile = 4;
         dim3 prefill_grid((sequence_length + token_tile - 1) / token_tile, (channels + 255) / 256, batch);
@@ -1524,30 +1537,34 @@ void causal_convolution(const Tensor& projected_qkv, const Tensor& weight, Tenso
         causal_convolution_save_state_kernel<scalar_t><<<state_grid, 256, 0, context.stream()>>>(
             static_cast<const scalar_t*>(projected_qkv.data()), static_cast<scalar_t*>(convolution_state.data()),
             state_slots, context_lengths, sequence_length, channels, input_stride, kernel_size);
-    });
-    check_launch("linear attention causal convolution");
+        return {};
+    }));
+    return check_launch("linear attention causal convolution");
 }
 
-void gated_delta_net(const Tensor& mixed_qkv, const Tensor& gate, const Tensor& decay, const Tensor& beta,
-                     const Tensor& decay_log, const Tensor& decay_bias, const Tensor& norm_weight,
-                     Tensor& recurrent_state, const int* state_slots, const int* context_lengths, Tensor& output,
-                     GatedDeltaNetWorkspace* workspace, double epsilon, const device::Context& context)
+Status gated_delta_net(const Tensor& mixed_qkv, const Tensor& gate, const Tensor& decay, const Tensor& beta,
+                       const Tensor& decay_log, const Tensor& decay_bias, const Tensor& norm_weight,
+                       Tensor& recurrent_state, const int* state_slots, const int* context_lengths, Tensor& output,
+                       GatedDeltaNetWorkspace* workspace, double epsilon, const device::Context& context)
 {
     if (!state_slots || decay_log.dtype() != DType::F32 || norm_weight.dtype() != DType::F32)
-        throw std::runtime_error("invalid linear attention Gated DeltaNet state or parameter dtype");
+        return unexpected(Error{ErrorCode::InvalidArgument,
+                                "invalid linear attention Gated DeltaNet state or parameter dtype"});
     const int batch = mixed_qkv.shape()[0];
     const int sequence_length = mixed_qkv.shape()[1];
     const int head_count = decay.shape()[2];
     const int gate_stride = gate.strides()[1];
     const int decay_stride = decay.strides()[1];
     const int beta_stride = beta.strides()[1];
-    if (decay_stride != beta_stride) throw std::runtime_error("linear attention Gated DeltaNet scalar stride mismatch");
+    if (decay_stride != beta_stride)
+        return unexpected(Error{ErrorCode::InvalidArgument,
+                                "linear attention Gated DeltaNet scalar stride mismatch"});
     constexpr int head_dimension = 128;
     if (mixed_qkv.shape()[2] != head_count * head_dimension * 3 || output.shape()[2] != head_count * head_dimension)
-        throw std::runtime_error("unsupported linear attention Gated DeltaNet shape");
-    dispatch_half_type(mixed_qkv.dtype(), [&]<typename scalar_t>()
+        return unexpected(Error{ErrorCode::InvalidArgument, "unsupported linear attention Gated DeltaNet shape"});
+    FIREFLY_TRY(dispatch_half_type(mixed_qkv.dtype(), [&]<typename scalar_t>() -> Status
     {
-        dispatch_state_type(recurrent_state.dtype(), [&]<typename state_scalar_t>()
+        return dispatch_state_type(recurrent_state.dtype(), [&]<typename state_scalar_t>() -> Status
         {
             if (sequence_length == 1)
             {
@@ -1560,7 +1577,8 @@ void gated_delta_net(const Tensor& mixed_qkv, const Tensor& gate, const Tensor& 
                                decode_state_bytes) == cudaSuccess;
                 }();
                 if (!decode_state_configured)
-                    throw std::runtime_error("linear attention GDN decode state shared memory exceeds device limit");
+                    return unexpected(Error{ErrorCode::Unavailable,
+                                            "linear attention GDN decode state shared memory exceeds device limit"});
                 dim3 grid(batch, head_count);
                 gated_delta_net_kernel<scalar_t, state_scalar_t, head_dimension, true>
                     <<<grid, head_dimension, decode_state_bytes, context.stream()>>>(
@@ -1571,42 +1589,44 @@ void gated_delta_net(const Tensor& mixed_qkv, const Tensor& gate, const Tensor& 
                         static_cast<state_scalar_t*>(recurrent_state.data()), state_slots, context_lengths,
                         static_cast<scalar_t*>(output.data()), sequence_length, head_count, gate_stride,
                         decay_stride, static_cast<float>(epsilon));
-                return;
+                return {};
             }
-            if (!workspace || !workspace->impl_) throw std::runtime_error("linear attention GDN prefill requires workspace");
+            if (!workspace || !workspace->impl_)
+                return unexpected(Error{ErrorCode::InvalidArgument,
+                                        "linear attention GDN prefill requires workspace"});
             const char* prefill_backend = std::getenv("FIREFLY_QWEN35_GDN_PREFILL_BACKEND");
             if (!prefill_backend || std::strcmp(prefill_backend, "fused") == 0 ||
                 std::strcmp(prefill_backend, "chunk64") == 0 ||
                 std::strcmp(prefill_backend, "chunk32") == 0 || std::strcmp(prefill_backend, "chunk16") == 0)
             {
                 if (prefill_backend && std::strcmp(prefill_backend, "chunk32") == 0)
-                    gated_delta_net_chunk<scalar_t, state_scalar_t, head_dimension, 32>(
+                    FIREFLY_TRY((gated_delta_net_chunk<scalar_t, state_scalar_t, head_dimension, 32>(
                         static_cast<const scalar_t*>(mixed_qkv.data()), static_cast<const scalar_t*>(gate.data()),
                         static_cast<const scalar_t*>(decay.data()), static_cast<const scalar_t*>(beta.data()),
                         static_cast<const float*>(decay_log.data()), static_cast<const scalar_t*>(decay_bias.data()),
                         static_cast<const float*>(norm_weight.data()),
                         static_cast<state_scalar_t*>(recurrent_state.data()), state_slots, context_lengths,
                         static_cast<scalar_t*>(output.data()), batch, sequence_length, head_count, gate_stride,
-                        decay_stride, *workspace->impl_, static_cast<float>(epsilon), context);
+                        decay_stride, *workspace->impl_, static_cast<float>(epsilon), context)));
                 else if (prefill_backend && std::strcmp(prefill_backend, "chunk16") == 0)
-                    gated_delta_net_chunk<scalar_t, state_scalar_t, head_dimension, 16>(
+                    FIREFLY_TRY((gated_delta_net_chunk<scalar_t, state_scalar_t, head_dimension, 16>(
                         static_cast<const scalar_t*>(mixed_qkv.data()), static_cast<const scalar_t*>(gate.data()),
                         static_cast<const scalar_t*>(decay.data()), static_cast<const scalar_t*>(beta.data()),
                         static_cast<const float*>(decay_log.data()), static_cast<const scalar_t*>(decay_bias.data()),
                         static_cast<const float*>(norm_weight.data()),
                         static_cast<state_scalar_t*>(recurrent_state.data()), state_slots, context_lengths,
                         static_cast<scalar_t*>(output.data()), batch, sequence_length, head_count, gate_stride,
-                        decay_stride, *workspace->impl_, static_cast<float>(epsilon), context);
+                        decay_stride, *workspace->impl_, static_cast<float>(epsilon), context)));
                 else
-                    gated_delta_net_chunk<scalar_t, state_scalar_t, head_dimension, 64>(
+                    FIREFLY_TRY((gated_delta_net_chunk<scalar_t, state_scalar_t, head_dimension, 64>(
                         static_cast<const scalar_t*>(mixed_qkv.data()), static_cast<const scalar_t*>(gate.data()),
                         static_cast<const scalar_t*>(decay.data()), static_cast<const scalar_t*>(beta.data()),
                         static_cast<const float*>(decay_log.data()), static_cast<const scalar_t*>(decay_bias.data()),
                         static_cast<const float*>(norm_weight.data()),
                         static_cast<state_scalar_t*>(recurrent_state.data()), state_slots, context_lengths,
                         static_cast<scalar_t*>(output.data()), batch, sequence_length, head_count, gate_stride,
-                        decay_stride, *workspace->impl_, static_cast<float>(epsilon), context);
-                return;
+                        decay_stride, *workspace->impl_, static_cast<float>(epsilon), context)));
+                return {};
             }
             const bool use_shared_state = prefill_backend && std::strcmp(prefill_backend, "shared") == 0;
             constexpr int shared_state_bytes = head_dimension * head_dimension * sizeof(float);
@@ -1648,9 +1668,10 @@ void gated_delta_net(const Tensor& mixed_qkv, const Tensor& gate, const Tensor& 
                         static_cast<scalar_t*>(output.data()), sequence_length, head_count, gate_stride,
                         decay_stride, static_cast<float>(epsilon));
             }
+            return {};
         });
-    });
-    check_launch("linear attention Gated DeltaNet");
+    }));
+    return check_launch("linear attention Gated DeltaNet");
 }
 
 }  // namespace firefly::kernels::linear_attention

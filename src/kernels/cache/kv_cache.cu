@@ -1,4 +1,5 @@
 #include "firefly/kernels/cache/kv_cache.h"
+#include "firefly/device/error.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -201,21 +202,23 @@ void launch_quantized_append(const Tensor& key, const Tensor& value, Tensor& key
 }
 }  // namespace
 
-void append_paged_kv(const Tensor& key, const Tensor& value, Tensor& key_cache, Tensor& value_cache,
-                     const int* block_table, const int* context_lens, int max_blocks_per_sequence,
-                     Tensor* scale_cache,
-                     const device::Context& context)
+Status append_paged_kv(const Tensor& key, const Tensor& value, Tensor& key_cache, Tensor& value_cache,
+                       const int* block_table, const int* context_lens, int max_blocks_per_sequence,
+                       Tensor* scale_cache, const device::Context& context)
 {
-    if (block_table == nullptr) throw std::invalid_argument("append_paged_kv requires a block table");
+    if (block_table == nullptr)
+        return unexpected(Error{ErrorCode::InvalidArgument, "append_paged_kv requires a block table"});
     if (key.shape().size() != 4 || value.shape() != key.shape())
-        throw std::invalid_argument("append_paged_kv expects matching rank-4 key/value tensors");
+        return unexpected(Error{ErrorCode::InvalidArgument,
+                                "append_paged_kv expects matching rank-4 key/value tensors"});
     if (key.dtype() != value.dtype())
-        throw std::invalid_argument("append_paged_kv requires matching dtypes");
+        return unexpected(Error{ErrorCode::InvalidArgument, "append_paged_kv requires matching dtypes"});
 
     if (scale_cache != nullptr)
     {
         if (key_cache.dtype() != DType::I8 || value_cache.dtype() != DType::I8 || scale_cache->dtype() != DType::F32)
-            throw std::invalid_argument("quantized append requires I8 caches and F32 scales");
+            return unexpected(Error{ErrorCode::InvalidArgument,
+                                    "quantized append requires I8 caches and F32 scales"});
         if (key.dtype() == DType::BF16)
             launch_quantized_append<__nv_bfloat16>(key, value, key_cache, value_cache, *scale_cache, block_table,
                                                    context_lens, max_blocks_per_sequence, context.stream());
@@ -223,12 +226,15 @@ void append_paged_kv(const Tensor& key, const Tensor& value, Tensor& key_cache, 
             launch_quantized_append<half>(key, value, key_cache, value_cache, *scale_cache, block_table,
                                           context_lens, max_blocks_per_sequence, context.stream());
         else
-            throw std::invalid_argument("quantized append only supports float16/bfloat16 inputs");
-        return;
+            return unexpected(Error{ErrorCode::InvalidArgument,
+                                    "quantized append only supports float16/bfloat16 inputs"});
+        const cudaError_t error = cudaGetLastError();
+        if (error != cudaSuccess) return unexpected(device::cuda_error(error, "append quantized paged KV"));
+        return {};
     }
 
     if (key.dtype() != key_cache.dtype() || key.dtype() != value_cache.dtype())
-        throw std::invalid_argument("append_paged_kv requires matching dtypes");
+        return unexpected(Error{ErrorCode::InvalidArgument, "append_paged_kv requires matching dtypes"});
 
     if (key.dtype() == DType::BF16)
         launch_append<__nv_bfloat16>(key, value, key_cache, value_cache, block_table, context_lens,
@@ -237,21 +243,27 @@ void append_paged_kv(const Tensor& key, const Tensor& value, Tensor& key_cache, 
         launch_append<half>(key, value, key_cache, value_cache, block_table, context_lens,
                             max_blocks_per_sequence, context.stream());
     else
-        throw std::invalid_argument("append_paged_kv only supports float16/bfloat16");
+        return unexpected(Error{ErrorCode::InvalidArgument,
+                                "append_paged_kv only supports float16/bfloat16"});
+    const cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) return unexpected(device::cuda_error(error, "append paged KV"));
+    return {};
 }
 
-void append_paged_kv_ragged(const Tensor& key, const Tensor& value, Tensor& key_cache, Tensor& value_cache,
-                            const int* block_table, const int* seq_offsets, const int* seq_lengths,
-                            const int* context_lens, int batch_size, int max_sequence_length,
-                            int max_blocks_per_sequence,
-                            const device::Context& context)
+Status append_paged_kv_ragged(const Tensor& key, const Tensor& value, Tensor& key_cache, Tensor& value_cache,
+                              const int* block_table, const int* seq_offsets, const int* seq_lengths,
+                              const int* context_lens, int batch_size, int max_sequence_length,
+                              int max_blocks_per_sequence, const device::Context& context)
 {
     if (block_table == nullptr || seq_offsets == nullptr || seq_lengths == nullptr || context_lens == nullptr)
-        throw std::invalid_argument("append_paged_kv_ragged requires block table and ragged metadata");
+        return unexpected(Error{ErrorCode::InvalidArgument,
+                                "append_paged_kv_ragged requires block table and ragged metadata"});
     if (key.shape().size() != 3 || value.shape() != key.shape())
-        throw std::invalid_argument("append_paged_kv_ragged expects rank-3 flattened key/value tensors");
+        return unexpected(Error{ErrorCode::InvalidArgument,
+                                "append_paged_kv_ragged expects rank-3 flattened key/value tensors"});
     if (key.dtype() != value.dtype() || key.dtype() != key_cache.dtype() || key.dtype() != value_cache.dtype())
-        throw std::invalid_argument("append_paged_kv_ragged requires matching dtypes");
+        return unexpected(Error{ErrorCode::InvalidArgument,
+                                "append_paged_kv_ragged requires matching dtypes"});
 
     if (key.dtype() == DType::BF16)
         launch_append_ragged<__nv_bfloat16>(key, value, key_cache, value_cache, block_table, seq_offsets,
@@ -262,7 +274,11 @@ void append_paged_kv_ragged(const Tensor& key, const Tensor& value, Tensor& key_
                                    context_lens, batch_size, max_sequence_length, max_blocks_per_sequence,
                                    context.stream());
     else
-        throw std::invalid_argument("append_paged_kv_ragged only supports float16/bfloat16");
+        return unexpected(Error{ErrorCode::InvalidArgument,
+                                "append_paged_kv_ragged only supports float16/bfloat16"});
+    const cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) return unexpected(device::cuda_error(error, "append ragged paged KV"));
+    return {};
 }
 
 }  // namespace firefly::kernels

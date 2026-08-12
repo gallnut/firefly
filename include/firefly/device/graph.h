@@ -17,18 +17,22 @@ namespace firefly::device
 class Graph
 {
 public:
+    /** @brief Constructs an empty graph wrapper. */
     Graph() = default;
 
-    // Move-only
+    /** @brief CUDA graph ownership cannot be copied. */
     Graph(const Graph&) = delete;
+    /** @brief CUDA graph ownership cannot be copy-assigned. */
     Graph& operator=(const Graph&) = delete;
 
+    /** @brief Transfers graph and executable ownership from another wrapper. */
     Graph(Graph&& other) noexcept : graph_(other.graph_), exec_(other.exec_)
     {
         other.graph_ = nullptr;
         other.exec_ = nullptr;
     }
 
+    /** @brief Releases current resources and transfers ownership from another wrapper. */
     Graph& operator=(Graph&& other) noexcept
     {
         if (this != &other)
@@ -42,6 +46,7 @@ public:
         return *this;
     }
 
+    /** @brief Destroys both the executable graph and captured graph definition. */
     ~Graph() { destroy(); }
 
     /**
@@ -51,7 +56,7 @@ public:
      * @param func A lambda or function executing the CUDA kernels/memcpys.
      * @return Result<void> Success or failure.
      */
-    Result<void> capture(cudaStream_t stream, std::function<void()> func)
+    Result<void> capture(cudaStream_t stream, std::function<Status()> func)
     {
         // Destroy previous graph if any
         destroy();
@@ -59,29 +64,22 @@ public:
         cudaError_t err = cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal);
         if (err != cudaSuccess)
         {
-            return unexpected(Error{static_cast<int>(err), ErrorCategory::CUDA, "Failed to begin stream capture"});
+            return unexpected(cuda_error(err, "begin CUDA stream capture"));
         }
 
-        try
+        auto callback_status = func();
+        if (!callback_status)
         {
-            func();
-        }
-        catch (const std::exception& e)
-        {
-            cudaStreamEndCapture(stream, &graph_);
-            return unexpected(
-                Error{-1, ErrorCategory::Runtime, "Exception during graph capture: " + std::string(e.what())});
-        }
-        catch (...)
-        {
-            cudaStreamEndCapture(stream, &graph_);
-            return unexpected(Error{-1, ErrorCategory::Runtime, "Unknown exception during graph capture"});
+            cudaGraph_t abandoned_graph = nullptr;
+            cudaStreamEndCapture(stream, &abandoned_graph);
+            if (abandoned_graph != nullptr) cudaGraphDestroy(abandoned_graph);
+            return unexpected(std::move(callback_status.error()).with_context("execute CUDA graph capture callback"));
         }
 
         err = cudaStreamEndCapture(stream, &graph_);
         if (err != cudaSuccess)
         {
-            return unexpected(Error{static_cast<int>(err), ErrorCategory::CUDA, "Failed to end stream capture"});
+            return unexpected(cuda_error(err, "end CUDA stream capture"));
         }
 
         return instantiate();
@@ -97,23 +95,28 @@ public:
     {
         if (!exec_)
         {
-            return unexpected(Error{-1, ErrorCategory::Runtime, "Graph: Execution not instantiated. Did you capture?"});
+            return unexpected(Error{ErrorCode::InvalidState, "CUDA graph executable has not been instantiated"});
         }
 
         cudaError_t err = cudaGraphLaunch(exec_, stream);
         if (err != cudaSuccess)
         {
-            return unexpected(Error{static_cast<int>(err), ErrorCategory::CUDA, "Failed to launch graph"});
+            return unexpected(cuda_error(err, "launch CUDA graph"));
         }
         return {};
     }
 
+    /** @brief Returns true when no graph definition has been captured. */
     [[nodiscard]] bool empty() const { return graph_ == nullptr; }
 
 private:
-    cudaGraph_t     graph_{nullptr};
-    cudaGraphExec_t exec_{nullptr};
+    cudaGraph_t     graph_{nullptr}; ///< Owned captured graph definition.
+    cudaGraphExec_t exec_{nullptr}; ///< Owned executable instantiated from `graph_`.
 
+    /**
+     * @brief Rebuilds the executable CUDA graph from the current graph definition.
+     * @return Success, or a CUDA error when graph instantiation fails.
+     */
     Result<void> instantiate()
     {
         if (exec_)
@@ -134,12 +137,13 @@ private:
 
             if (err != cudaSuccess)
             {
-                return unexpected(Error{static_cast<int>(err), ErrorCategory::CUDA, "Failed to instantiate graph"});
+                return unexpected(cuda_error(err, "instantiate CUDA graph"));
             }
         }
         return {};
     }
 
+    /** @brief Releases owned executable and graph handles and restores the empty state. */
     void destroy()
     {
         if (exec_)

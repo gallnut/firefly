@@ -1,15 +1,16 @@
 #include <gtest/gtest.h>
 
 #include "firefly/model/registry.h"
+#include "firefly/model/speculative.h"
 
 TEST(ModelRegistry, CreatesBuiltinQwenArchitectures)
 {
     firefly::model::ModelDescriptor descriptor;
 
     descriptor.architecture = "Qwen2ForCausalLM";
-    EXPECT_NE(firefly::model::ModelRegistry::get().create(descriptor), nullptr);
+    EXPECT_TRUE(firefly::model::ModelRegistry::get().create(descriptor).has_value());
     descriptor.architecture = "Qwen3ForCausalLM";
-    EXPECT_NE(firefly::model::ModelRegistry::get().create(descriptor), nullptr);
+    EXPECT_TRUE(firefly::model::ModelRegistry::get().create(descriptor).has_value());
 }
 
 TEST(ModelRegistry, CreatesQwen35WithHybridRuntimeRequirements)
@@ -36,8 +37,8 @@ TEST(ModelRegistry, CreatesQwen35WithHybridRuntimeRequirements)
         "rope_parameters":{"partial_rotary_factor":0.25},"tie_word_embeddings":true}})";
 
     auto model = firefly::model::ModelRegistry::get().create(descriptor);
-    ASSERT_NE(model, nullptr);
-    const auto requirements = model->runtime_requirements();
+    ASSERT_TRUE(model.has_value()) << model.error().describe();
+    const auto requirements = model.value()->runtime_requirements();
     EXPECT_EQ(requirements.kv_cache_layer_count, 1);
     EXPECT_EQ(requirements.kv_cache_head_count, 2);
     EXPECT_EQ(requirements.kv_cache_head_dim, 256);
@@ -45,4 +46,34 @@ TEST(ModelRegistry, CreatesQwen35WithHybridRuntimeRequirements)
     EXPECT_TRUE(requirements.sequence_state);
     EXPECT_FALSE(requirements.prefix_cache);
     EXPECT_FALSE(requirements.cuda_graph);
+}
+
+TEST(ModelRegistry, CreatesQwen3DSpark)
+{
+    firefly::model::ModelDescriptor descriptor;
+    descriptor.architecture = "Qwen3DSparkModel";
+    descriptor.config = {
+        .dtype = firefly::DType::BF16,
+        .hidden_size = 1024,
+        .intermediate_size = 3584,
+        .num_hidden_layers = 5,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 2,
+        .head_dim = 256,
+        .vocab_size = 248320,
+        .max_position_embeddings = 262144,
+        .rms_norm_eps = 1e-6,
+        .rope_theta = 1e7f,
+    };
+    descriptor.raw_config = R"({"markov_rank":256,"enable_confidence_head":true,"block_size":7,
+        "target_layer_ids":[1,2,3],"mask_token_id":248200})";
+    auto model = firefly::model::ModelRegistry::get().create(descriptor);
+    ASSERT_TRUE(model.has_value()) << model.error().describe();
+    auto* proposer = dynamic_cast<firefly::model::SpeculativeProposer*>(model.value().get());
+    ASSERT_NE(proposer, nullptr);
+    EXPECT_EQ(proposer->block_size(), 7);
+    const std::vector<int> expected_layers{0, 1, 2};
+    EXPECT_TRUE(std::ranges::equal(proposer->target_hidden_layers(), expected_layers));
+    EXPECT_TRUE(proposer->validate_target({.hidden_size = 1024, .vocab_size = 248320,
+                                          .num_hidden_layers = 24}).has_value());
 }

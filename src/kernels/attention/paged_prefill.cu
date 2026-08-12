@@ -516,7 +516,7 @@ __global__ void paged_prefill_wmma_qk_kernel(const scalar_t* __restrict__ Q, con
 }
 
 template <typename Scalar>
-void launch_paged_prefill_typed(Tensor& query, Tensor& key, Tensor& value, Tensor& output,
+Status launch_paged_prefill_typed(Tensor& query, Tensor& key, Tensor& value, Tensor& output,
                                 const AttentionOptions& options, float scale, cudaStream_t stream)
 {
     int batch_size = query.shape()[0];
@@ -532,7 +532,7 @@ void launch_paged_prefill_typed(Tensor& query, Tensor& key, Tensor& value, Tenso
                                        static_cast<const Scalar*>(value.data()), options.block_table,
                                        static_cast<Scalar*>(output.data()), options.context_lengths, num_heads,
                                        options.kv_head_count, sequence_length, options.max_context_blocks, scale);
-        return;
+        return {};
     }
 
     constexpr int query_block = 8;
@@ -547,30 +547,32 @@ void launch_paged_prefill_typed(Tensor& query, Tensor& key, Tensor& value, Tenso
                                        static_cast<Scalar*>(output.data()), options.context_lengths, num_heads,
                                        options.kv_head_count, sequence_length, head_dim, options.max_context_blocks,
                                        scale);
-        return;
+        return {};
     }
 
-    int  threads = attention_detail::thread_count(head_dim);
+    int  threads = FIREFLY_TRY(attention_detail::thread_count(head_dim));
     dim3 grid(sequence_length, num_heads, batch_size);
     paged_attention_kernel<Scalar><<<grid, threads, threads * sizeof(float), stream>>>(
         static_cast<const Scalar*>(query.data()), static_cast<const Scalar*>(key.data()),
         static_cast<const Scalar*>(value.data()), options.block_table, static_cast<Scalar*>(output.data()), batch_size,
         options.context_lengths, num_heads, options.kv_head_count, sequence_length, head_dim,
         options.max_context_blocks, scale);
+    return {};
 }
 }  // namespace
 
-void attention_detail::launch_paged_prefill(Tensor& query, Tensor& key, Tensor& value, Tensor& output,
-                                            const AttentionOptions& options, float scale,
-                                            const device::Context& context)
+Status attention_detail::launch_paged_prefill(Tensor& query, Tensor& key, Tensor& value, Tensor& output,
+                                              const AttentionOptions& options, float scale,
+                                              const device::Context& context)
 {
     if (query.dtype() == DType::BF16)
     {
-        launch_paged_prefill_typed<__nv_bfloat16>(query, key, value, output, options, scale, context.stream());
+        return launch_paged_prefill_typed<__nv_bfloat16>(query, key, value, output, options, scale,
+                                                         context.stream());
     }
     else
     {
-        launch_paged_prefill_typed<half>(query, key, value, output, options, scale, context.stream());
+        return launch_paged_prefill_typed<half>(query, key, value, output, options, scale, context.stream());
     }
 }
 }  // namespace firefly::kernels
